@@ -28,6 +28,7 @@ import {
   EmbedBuilder,
   MessageFlags,
   Status,
+  ActivityType,
   DiscordAPIError,
   resolveColor,
   type Message,
@@ -791,6 +792,66 @@ function stopTyping(chatId: string): void {
     clearInterval(existing)
     typingIntervals.delete(chatId)
   }
+}
+
+// ── Auto-presence (opt-in; the activity + typing flags are independent) ────────
+// The custom-status TEXT is driven by a control file that Claude Code hooks write
+// (working…/editing…/pushing…; the Stop hook clears it); the watcher applies it.
+// Typing is started in handleInbound (real Discord inbound only) and stopped here
+// when the file clears — so non-Discord turns (cron/CLI) never trigger typing.
+const PRESENCE_FILE = join(STATE_DIR, '.presence-activity')
+const PRESENCE_ACTIVITY = process.env.DISCORD_PRESENCE_ACTIVITY === '1'
+const PRESENCE_TYPING = process.env.DISCORD_PRESENCE_TYPING === '1'
+const PRESENCE_BACKSTOP_MS = 120_000
+let presenceChannelId: string | null = null
+let lastPresenceText: string | null = null
+let presenceBackstop: ReturnType<typeof setTimeout> | null = null
+
+function sanitizeStatus(s: string): string {
+  return s.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 128)
+}
+
+// Apply the current status text. '' clears both effects. Deduped so the 1s poll
+// doesn't re-issue identical setPresence/typing calls (also keeps us under the
+// presence rate limit).
+function applyPresence(text: string): void {
+  text = sanitizeStatus(text)
+  if (text === lastPresenceText) return
+  lastPresenceText = text
+
+  if (PRESENCE_ACTIVITY && client.user) {
+    try {
+      client.user.setPresence(text
+        ? { activities: [{ name: client.user.username, state: text, type: ActivityType.Custom }] }
+        : { activities: [] })
+    } catch { /* presence set is best-effort */ }
+  }
+
+  // Typing is *started* in handleInbound; here we only stop it on turn-end (file
+  // cleared by the Stop hook), then drop the channel so a stale one can't be
+  // re-typed on an unrelated turn.
+  if (PRESENCE_TYPING && !text && presenceChannelId) {
+    stopTyping(presenceChannelId)
+    presenceChannelId = null
+  }
+
+  if (presenceBackstop) { clearTimeout(presenceBackstop); presenceBackstop = null }
+  if (text) presenceBackstop = setTimeout(() => {
+    try { writeFileSync(PRESENCE_FILE, '') } catch { /* best-effort */ }
+    applyPresence('')
+  }, PRESENCE_BACKSTOP_MS)
+}
+
+// Poll the control file ~1s and apply. Reads every tick (no mtime gate — back-to-
+// back writes can share an mtime); the dedupe above keeps it cheap.
+function startPresenceWatcher(): void {
+  if (!PRESENCE_ACTIVITY && !PRESENCE_TYPING) return
+  applyPresence('')  // clear any stale status from a mid-turn restart
+  setInterval(() => {
+    let text = ''
+    try { text = readFileSync(PRESENCE_FILE, 'utf8') } catch { /* absent = cleared */ }
+    applyPresence(text)
+  }, 1000)
 }
 
 // The standard "open a channel for sending" preamble shared by reply,
@@ -2331,8 +2392,14 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
-  // Typing indicator removed — was firing on every inbound message even when
-  // the bot decides not to respond, making it look like it's always typing.
+  // Auto-typing (opt-in via DISCORD_PRESENCE_TYPING, off by default): start the
+  // typing indicator on every delivered inbound. The Stop hook clears it (via
+  // applyPresence('')) reliably at turn-end — including turns with no reply, the
+  // piece that was missing when this was disabled before.
+  if (PRESENCE_TYPING && 'sendTyping' in msg.channel) {
+    presenceChannelId = chat_id
+    startTyping(msg.channel, chat_id)
+  }
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   if (result.access.ackReaction) {
@@ -2429,6 +2496,7 @@ async function syncSlashCommands(appId: string): Promise<void> {
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
   startWatchdog()
+  startPresenceWatcher()
   void syncSlashCommands(c.user.id)
 })
 
