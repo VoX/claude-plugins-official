@@ -802,15 +802,15 @@ function stopTyping(chatId: string): void {
 const PRESENCE_FILE = join(STATE_DIR, '.presence-activity')
 const PRESENCE_ACTIVITY = process.env.DISCORD_PRESENCE_ACTIVITY === '1'
 const PRESENCE_TYPING = process.env.DISCORD_PRESENCE_TYPING === '1'
-const PRESENCE_WINDOW_MS = 20_000        // Discord limits presence updates to ~5 per 20s
-const PRESENCE_WINDOW_MAX = 5            // hard ceiling: <=5 wire writes per sliding 20s window
-const PRESENCE_IDLE_LINGER_MS = 3_000    // hold the final aggregate before settling to idle
+const PRESENCE_POLL_MS = 250             // detect new events fast (publish cadence governed by the timers below)
+const PRESENCE_DEBOUNCE_MS = 1_000       // after the first event, wait 1s accumulating before publishing
+const PRESENCE_COOLDOWN_MS = 4_500       // min gap between publishes (≈Discord's 5/20s limit); ALL writes respect it
 let presenceChannelId: string | null = null
 let lastPresenceText: string | null = null
-let pendingPresenceText: string | null = null
-let presenceFlush: ReturnType<typeof setTimeout> | null = null
-let presenceIdleLinger: ReturnType<typeof setTimeout> | null = null
-let presenceWriteTimes: number[] = []    // timestamps of recent wire writes (sliding-window limiter)
+let presenceShownLines = 0               // high-water mark: sequence lines already published
+let lastRawSeen = ''                     // detect file replacement (--start) vs append
+let lastPublishAt = 0                    // epoch ms of last actual publish (cooldown anchor; epoch 0 = long ago)
+let firstPendingAt = 0                   // epoch ms the current un-published batch's first event arrived
 
 function sanitizeStatus(s: string): string {
   return s.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 128)
@@ -819,58 +819,11 @@ function sanitizeStatus(s: string): string {
 const isResting = (t: string) => t === '' || isIdle(t)
 
 
-// Prune write-timestamps older than the sliding window and report whether a write is allowed now.
-function presenceWindowHasRoom(now: number): boolean {
-  while (presenceWriteTimes.length && presenceWriteTimes[0]! <= now - PRESENCE_WINDOW_MS) presenceWriteTimes.shift()
-  return presenceWriteTimes.length < PRESENCE_WINDOW_MAX
-}
-
-// Apply a composed status. Resting ('' or idle) -> idle dot + stop typing; active aggregate ->
-// green dot + text. A new active status applies IMMEDIATELY while the sliding window has room
-// (snappy: bursts of up to PRESENCE_WINDOW_MAX show at once); when the window is full, the latest
-// (most complete) aggregate coalesces and flushes the instant the oldest write ages out — a hard
-// <=5/20s ceiling that never stalls Discord's gateway. On turn-end (->idle) the final aggregate is
-// flushed, then idle settles after a short linger so a quick turn still shows what it did.
-function applyPresence(text: string): void {
+// The actual presence write (dot + activity text) + typing-stop. Deduped. Returns true iff an
+// actual wire write happened (so the caller only advances the cooldown on a real publish).
+function setPresenceNow(text: string): boolean {
   text = sanitizeStatus(text)
-  const now = Date.now()
-
-  if (isResting(text)) {
-    if (text === lastPresenceText) return                                 // already idle: no-op
-    if (pendingPresenceText !== null) {                                   // flush final aggregate first
-      const agg = pendingPresenceText; pendingPresenceText = null
-      if (presenceFlush) { clearTimeout(presenceFlush); presenceFlush = null }
-      setPresenceNow(agg)
-    }
-    if (!presenceIdleLinger) {                                            // settle to idle once, no per-tick reset
-      presenceIdleLinger = setTimeout(() => { presenceIdleLinger = null; setPresenceNow(text) }, PRESENCE_IDLE_LINGER_MS)
-    }
-    return
-  }
-
-  // active: cancel a pending idle from the previous turn-end
-  if (presenceIdleLinger) { clearTimeout(presenceIdleLinger); presenceIdleLinger = null }
-  if (text === lastPresenceText) return                                  // already showing it: no-op
-
-  if (presenceWindowHasRoom(now)) { setPresenceNow(text); return }        // room -> show now
-
-  // window full: coalesce the latest aggregate, flush when the oldest write ages out
-  pendingPresenceText = text
-  if (!presenceFlush) {
-    const wait = Math.max(0, presenceWriteTimes[0]! + PRESENCE_WINDOW_MS - now)
-    presenceFlush = setTimeout(() => {
-      presenceFlush = null
-      const t = pendingPresenceText; pendingPresenceText = null
-      if (t !== null) applyPresence(t)
-    }, wait)
-  }
-}
-
-// The actual presence write (dot + activity text) + typing-stop. Deduped; records the write time.
-function setPresenceNow(text: string): void {
-  if (presenceFlush) { clearTimeout(presenceFlush); presenceFlush = null; pendingPresenceText = null }
-  if (text === lastPresenceText) return  // dedupe: no wire write recorded
-  presenceWriteTimes.push(Date.now())
+  if (text === lastPresenceText) return false  // dedupe: no wire write
   lastPresenceText = text
   const resting = isResting(text)
 
@@ -888,20 +841,62 @@ function setPresenceNow(text: string): void {
     stopTyping(presenceChannelId)
     presenceChannelId = null
   }
+  return true
 }
 
-// Poll the sequence file ~1s, compose the aggregate, and apply. No staleness backstop: composePresence
-// is order-authoritative (idle rests only if it's the last line), the Stop hook writes idle at turn-end,
-// the next turn's --start resets, and the startup clear covers a crash — so a long single operation
-// (e.g. a multi-hour build) correctly stays green/active for its whole duration.
+// Poll the sequence file (~250ms) and publish per VoX's two-timer model. Each publish shows the
+// distinct actions appended SINCE THE LAST PUBLISH (advancing presenceShownLines), so the status
+// tracks what's happening NOW, not a whole-turn aggregate. publishAt = max(firstEventOfBatch +
+// DEBOUNCE, lastPublish + COOLDOWN): a fresh batch waits 1s to accumulate, then publishes; the 4.5s
+// cooldown (≈Discord's 5/20s limit) gates EVERY publish — including turn-end idle, which is just
+// another publish (no bypass), so we can't exceed the limit. When actions and a trailing idle are both
+// unshown (a quick turn), the actions publish first and the idle line is left for the next publish, so
+// the final action shows then the dot settles to idle one cooldown later. A file replacement (--start,
+// detected via !startsWith) resets the high-water mark. No staleness backstop: a long single op holds
+// its status (idle comes only from the Stop hook, which appends idle as the last line).
+function tickPresence(): void {
+  let raw = ''
+  try { raw = readFileSync(PRESENCE_FILE, 'utf8') } catch { /* absent = resting */ }
+  if (!raw.startsWith(lastRawSeen)) { presenceShownLines = 0; firstPendingAt = 0 }  // file replaced → new turn
+  lastRawSeen = raw
+  const lines = raw.split('\n').map(l => l.trim()).filter(Boolean)
+  const now = Date.now()
+
+  if (lines.length === 0) {                                     // empty/absent → resting, no text
+    setPresenceNow('')
+    firstPendingAt = 0
+    return
+  }
+
+  const tail = lines.slice(presenceShownLines)                 // un-published lines
+  if (tail.length === 0) { firstPendingAt = 0; return }        // nothing new → hold current display
+
+  if (firstPendingAt === 0) firstPendingAt = now               // first event of this batch
+  const readyAt = Math.max(firstPendingAt + PRESENCE_DEBOUNCE_MS, lastPublishAt + PRESENCE_COOLDOWN_MS)
+  if (now < readyAt) return                                    // debounce/cooldown not elapsed → accumulate
+
+  // Split: unshown ACTIONS (drop a trailing idle + any stray idle) vs a trailing idle marker.
+  const trailingIdle = isIdle(tail[tail.length - 1]!)
+  const actions = (trailingIdle ? tail.slice(0, -1) : tail).filter(l => !isIdle(l))
+  if (actions.length) {
+    // publish the actions; if a trailing idle is also pending, leave it unshown so idle settles next cooldown
+    const batch = composePresence(actions.join('\n'))
+    if (batch && setPresenceNow(batch)) lastPublishAt = now
+    presenceShownLines = lines.length - (trailingIdle ? 1 : 0)
+  } else if (trailingIdle) {
+    // only the idle marker is unshown → settle the dot to idle (still cooldown-gated above)
+    if (setPresenceNow(PRESENCE_IDLE)) lastPublishAt = now
+    presenceShownLines = lines.length
+  } else {
+    presenceShownLines = lines.length                          // nothing showable (e.g. stray idle only)
+  }
+  firstPendingAt = 0
+}
+
 function startPresenceWatcher(): void {
   if (!PRESENCE_ACTIVITY && !PRESENCE_TYPING) return
   setPresenceNow('')  // clear any stale status from a mid-turn restart
-  setInterval(() => {
-    let raw = ''
-    try { raw = readFileSync(PRESENCE_FILE, 'utf8') } catch { /* absent = resting */ }
-    applyPresence(composePresence(raw))
-  }, 1000)
+  setInterval(tickPresence, PRESENCE_POLL_MS)
 }
 
 // The standard "open a channel for sending" preamble shared by reply,
@@ -2443,9 +2438,9 @@ async function handleInbound(msg: Message): Promise<void> {
   }
 
   // Auto-typing (opt-in via DISCORD_PRESENCE_TYPING, off by default): start the
-  // typing indicator on every delivered inbound. The Stop hook clears it (via
-  // applyPresence('')) reliably at turn-end — including turns with no reply, the
-  // piece that was missing when this was disabled before.
+  // typing indicator on every delivered inbound. The Stop hook appends idle, which the
+  // watcher (tickPresence → setPresenceNow) turns into a resting state that stops typing —
+  // reliably at turn-end, including turns with no reply (the piece missing when this was disabled).
   if (PRESENCE_TYPING && 'sendTyping' in msg.channel) {
     presenceChannelId = chat_id
     startTyping(msg.channel, chat_id)
