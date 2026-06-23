@@ -806,6 +806,10 @@ const PRESENCE_BACKSTOP_MS = 120_000
 let presenceChannelId: string | null = null
 let lastPresenceText: string | null = null
 let presenceBackstop: ReturnType<typeof setTimeout> | null = null
+const PRESENCE_MIN_INTERVAL_MS = 12_000
+let lastPresenceSetAt = 0
+let pendingPresenceText: string | null = null
+let presenceFlush: ReturnType<typeof setTimeout> | null = null
 
 function sanitizeStatus(s: string): string {
   return s.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 128)
@@ -816,7 +820,22 @@ function sanitizeStatus(s: string): string {
 // presence rate limit).
 function applyPresence(text: string): void {
   text = sanitizeStatus(text)
-  if (text === lastPresenceText) return
+  // Throttle: Discord drops presence updates over ~5/20s and discord.js does not
+  // rate-limit them, so tool-heavy turns would freeze the status. Coalesce non-empty
+  // updates to one per PRESENCE_MIN_INTERVAL_MS (latest wins); clears ('') go immediately.
+  const now = Date.now()
+  if (text !== '' && now - lastPresenceSetAt < PRESENCE_MIN_INTERVAL_MS) {
+    pendingPresenceText = text
+    if (!presenceFlush) presenceFlush = setTimeout(() => {
+      presenceFlush = null
+      const t = pendingPresenceText; pendingPresenceText = null
+      if (t !== null) applyPresence(t)
+    }, PRESENCE_MIN_INTERVAL_MS - (now - lastPresenceSetAt))
+    return
+  }
+  if (presenceFlush) { clearTimeout(presenceFlush); presenceFlush = null; pendingPresenceText = null }
+  if (text === lastPresenceText) { lastPresenceSetAt = now; return }
+  lastPresenceSetAt = now
   lastPresenceText = text
 
   if (PRESENCE_ACTIVITY && client.user) {
