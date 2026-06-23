@@ -13,6 +13,6 @@ f="$dir/.presence-activity"
 mkdir -p "$dir"
 case "${1:-}" in
   --start) tmp="$f.tmp.$$"; printf '%s\n' "${2:-🐾 working…}" > "$tmp"; mv -f "$tmp" "$f" ;;
-  --idle)  tmp="$f.tmp.$$"; printf '%s\n' "💤 idle…"        > "$tmp"; mv -f "$tmp" "$f" ;;
+  --idle)  printf '%s\n' "💤 idle…" >> "$f" ;;   # APPEND so the final actions survive (composePresence rests on a TRAILING idle)
   *)       printf '%s\n' "${1:-}" >> "$f" ;;
 esac
