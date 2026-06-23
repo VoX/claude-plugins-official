@@ -802,16 +802,15 @@ function stopTyping(chatId: string): void {
 const PRESENCE_FILE = join(STATE_DIR, '.presence-activity')
 const PRESENCE_ACTIVITY = process.env.DISCORD_PRESENCE_ACTIVITY === '1'
 const PRESENCE_TYPING = process.env.DISCORD_PRESENCE_TYPING === '1'
-const PRESENCE_BACKSTOP_MS = 120_000
-const PRESENCE_MIN_INTERVAL_MS = 4_000   // floor between presence writes (Discord ~5/20s)
-const PRESENCE_IDLE_LINGER_MS = 4_000    // hold the final aggregate before settling to idle
+const PRESENCE_WINDOW_MS = 20_000        // Discord limits presence updates to ~5 per 20s
+const PRESENCE_WINDOW_MAX = 5            // hard ceiling: <=5 wire writes per sliding 20s window
+const PRESENCE_IDLE_LINGER_MS = 3_000    // hold the final aggregate before settling to idle
 let presenceChannelId: string | null = null
 let lastPresenceText: string | null = null
 let pendingPresenceText: string | null = null
-let lastPresenceSetAt = 0
 let presenceFlush: ReturnType<typeof setTimeout> | null = null
-let presenceBackstop: ReturnType<typeof setTimeout> | null = null
 let presenceIdleLinger: ReturnType<typeof setTimeout> | null = null
+let presenceWriteTimes: number[] = []    // timestamps of recent wire writes (sliding-window limiter)
 
 function sanitizeStatus(s: string): string {
   return s.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 128)
@@ -820,23 +819,30 @@ function sanitizeStatus(s: string): string {
 const isResting = (t: string) => t === '' || isIdle(t)
 
 
+// Prune write-timestamps older than the sliding window and report whether a write is allowed now.
+function presenceWindowHasRoom(now: number): boolean {
+  while (presenceWriteTimes.length && presenceWriteTimes[0]! <= now - PRESENCE_WINDOW_MS) presenceWriteTimes.shift()
+  return presenceWriteTimes.length < PRESENCE_WINDOW_MAX
+}
+
 // Apply a composed status. Resting ('' or idle) -> idle dot + stop typing; active aggregate ->
-// green dot + text. Throttled under Discord's ~5/20s presence limit: active growth coalesces
-// latest-wins (latest = most complete aggregate) within the floor; resting->active edges apply
-// immediately. On turn-end (->idle) the final aggregate is FLUSHED, then idle settles after a
-// short linger so a quick turn still shows what it did.
+// green dot + text. A new active status applies IMMEDIATELY while the sliding window has room
+// (snappy: bursts of up to PRESENCE_WINDOW_MAX show at once); when the window is full, the latest
+// (most complete) aggregate coalesces and flushes the instant the oldest write ages out — a hard
+// <=5/20s ceiling that never stalls Discord's gateway. On turn-end (->idle) the final aggregate is
+// flushed, then idle settles after a short linger so a quick turn still shows what it did.
 function applyPresence(text: string): void {
   text = sanitizeStatus(text)
   const now = Date.now()
 
   if (isResting(text)) {
-    if (text === lastPresenceText) { lastPresenceSetAt = now; return }   // already idle: no-op
-    if (pendingPresenceText !== null) {                                  // flush final aggregate first
+    if (text === lastPresenceText) return                                 // already idle: no-op
+    if (pendingPresenceText !== null) {                                   // flush final aggregate first
       const agg = pendingPresenceText; pendingPresenceText = null
       if (presenceFlush) { clearTimeout(presenceFlush); presenceFlush = null }
       setPresenceNow(agg)
     }
-    if (!presenceIdleLinger) {                                           // settle to idle once, no per-tick reset
+    if (!presenceIdleLinger) {                                            // settle to idle once, no per-tick reset
       presenceIdleLinger = setTimeout(() => { presenceIdleLinger = null; setPresenceNow(text) }, PRESENCE_IDLE_LINGER_MS)
     }
     return
@@ -844,26 +850,27 @@ function applyPresence(text: string): void {
 
   // active: cancel a pending idle from the previous turn-end
   if (presenceIdleLinger) { clearTimeout(presenceIdleLinger); presenceIdleLinger = null }
+  if (text === lastPresenceText) return                                  // already showing it: no-op
 
-  // coalesce active growth within the floor (keep the latest = most complete aggregate)
-  const lastActive = lastPresenceText !== null && !isResting(lastPresenceText)
-  if (lastActive && now - lastPresenceSetAt < PRESENCE_MIN_INTERVAL_MS) {
-    pendingPresenceText = text
-    if (!presenceFlush) presenceFlush = setTimeout(() => {
+  if (presenceWindowHasRoom(now)) { setPresenceNow(text); return }        // room -> show now
+
+  // window full: coalesce the latest aggregate, flush when the oldest write ages out
+  pendingPresenceText = text
+  if (!presenceFlush) {
+    const wait = Math.max(0, presenceWriteTimes[0]! + PRESENCE_WINDOW_MS - now)
+    presenceFlush = setTimeout(() => {
       presenceFlush = null
       const t = pendingPresenceText; pendingPresenceText = null
       if (t !== null) applyPresence(t)
-    }, PRESENCE_MIN_INTERVAL_MS - (now - lastPresenceSetAt))
-    return
+    }, wait)
   }
-  setPresenceNow(text)
 }
 
-// The actual presence write (dot + activity text) + typing-stop + backstop. Deduped.
+// The actual presence write (dot + activity text) + typing-stop. Deduped; records the write time.
 function setPresenceNow(text: string): void {
   if (presenceFlush) { clearTimeout(presenceFlush); presenceFlush = null; pendingPresenceText = null }
-  if (text === lastPresenceText) return  // dedupe: don't bump lastPresenceSetAt on a no-op
-  lastPresenceSetAt = Date.now()
+  if (text === lastPresenceText) return  // dedupe: no wire write recorded
+  presenceWriteTimes.push(Date.now())
   lastPresenceText = text
   const resting = isResting(text)
 
@@ -881,15 +888,12 @@ function setPresenceNow(text: string): void {
     stopTyping(presenceChannelId)
     presenceChannelId = null
   }
-
-  if (presenceBackstop) { clearTimeout(presenceBackstop); presenceBackstop = null }
-  if (!resting) presenceBackstop = setTimeout(() => {
-    try { writeFileSync(PRESENCE_FILE, PRESENCE_IDLE) } catch { /* best-effort */ }
-    applyPresence(PRESENCE_IDLE)
-  }, PRESENCE_BACKSTOP_MS)
 }
 
-// Poll the sequence file ~1s, compose the aggregate, and apply.
+// Poll the sequence file ~1s, compose the aggregate, and apply. No staleness backstop: composePresence
+// is order-authoritative (idle rests only if it's the last line), the Stop hook writes idle at turn-end,
+// the next turn's --start resets, and the startup clear covers a crash — so a long single operation
+// (e.g. a multi-hour build) correctly stays green/active for its whole duration.
 function startPresenceWatcher(): void {
   if (!PRESENCE_ACTIVITY && !PRESENCE_TYPING) return
   setPresenceNow('')  // clear any stale status from a mid-turn restart

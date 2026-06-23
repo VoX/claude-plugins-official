@@ -253,4 +253,17 @@ describe('composePresence', () => {
     expect(composePresence('')).toBe('')
     expect(composePresence('\n\n')).toBe('')
   })
+  test('idle rests only when it is the LAST line (terminal)', () => {
+    expect(composePresence('🐾 working…\n📖 reading…\n💤 idle…\n')).toBe('💤 idle…')
+  })
+  test('a tool append AFTER idle (race) shows the work, not idle', () => {
+    // Stop hook wrote idle, then an in-flight tool appended — work continued.
+    expect(composePresence('🐾 working…\n📖 reading…\n💤 idle…\n✏️ editing…\n')).toBe('📖 reading ✏️ editing…')
+  })
+  test('drops a stray mid-sequence idle, keeps all actions', () => {
+    expect(composePresence('📖 reading…\n💤 idle…\n⚙️ running…\n')).toBe('📖 reading ⚙️ running…')
+  })
+  test('the live-poison shape (idle first, work after) recovers to active', () => {
+    expect(composePresence('💤 idle…\n🤝 delegating…\n📖 reading…\n📖 reading…\n')).toBe('🤝 delegating 📖 reading…')
+  })
 })
