@@ -29,7 +29,7 @@ they're shown together (e.g. `📖 reading ✏️ editing…`); otherwise each s
   🤝 delegating (Task/Agent subagent), 💬 replying (Discord reply/embed/voice), 🔄 compacting (PreCompact).
 - the Bash classifier names the command: `npm ci` → `⚙️ run npm…`; on a chain it names the **rightmost**
   segment (the actual work), skipping `VAR=…`/`sudo`/`env` prefixes and `cd` setup — `cd /x && npm ci` →
-  `run npm`, `make && ./deploy.sh` → `run deploy.sh`. A bare `cd` writes nothing.
+  `run npm`, `make && ./deploy.sh` → `run deploy.sh`. A trailing `&& echo …` confirmation is skipped, and a bare `cd` writes nothing.
 - composition: **distinct** (deduped), first-occurrence order, space-joined with one trailing "…".
   "🐾 working…" shows only if it's the only thing that fired. Sentinels match by emoji (🐾/💤), so a
   command literally named "idle"/"working" isn't mistaken for one.
