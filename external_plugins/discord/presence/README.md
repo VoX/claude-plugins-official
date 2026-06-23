@@ -22,7 +22,7 @@ custom status.
 - `--start "🐾 working…"` (UserPromptSubmit) resets the sequence each turn.
 - each PreToolUse **appends** its action: 📖 reading (Read/WebFetch), 🔍 searching (Grep/Glob/WebSearch),
   ✏️ editing (Edit/Write/MultiEdit/NotebookEdit), ⬆️ pushing / 💾 committing / ⚙️ running (Bash, classified),
-  🤝 delegating (Task/Agent subagent), 🔄 compacting (PreCompact).
+  🤝 delegating (Task/Agent subagent), 💬 replying (Discord reply/embed/voice), 🔄 compacting (PreCompact).
 - composition: **distinct** (deduped), **first-occurrence order**, space-joined with one trailing "…".
   "🐾 working…" is dropped unless it's the only thing that fired. "💤 idle…" is unique (never combined).
 - Stop → `--idle`. The plugin **flushes the final aggregate, then settles to idle** after a short
