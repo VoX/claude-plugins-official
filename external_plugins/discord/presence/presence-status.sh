@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# Write the Discord custom-status text for the vox-plugins discord presence watcher.
-#   presence-status.sh "🐾 working…"     set the status text
-#   presence-status.sh --clear           clear it (Stop hook)
-# No-op unless a presence effect is enabled (the plugin's hooks are always-on). Atomic write.
+# Per-turn sequence-file writer for the vox-plugins discord presence aggregator.
+#   presence-status.sh --start "🐾 working…"   reset the sequence at turn start (UserPromptSubmit)
+#   presence-status.sh "📖 reading…"            append an action (PreToolUse)
+#   presence-status.sh --idle                   end the turn (Stop) → idle
+# No-op unless a presence effect is enabled (plugin hooks are always-on). Appends are a single
+# atomic O_APPEND write so parallel tool hooks can't clobber each other's lines; --start/--idle
+# atomically replace the whole file (tmp+mv).
 set -u
 [ "${DISCORD_PRESENCE_ACTIVITY:-}" = "1" ] || [ "${DISCORD_PRESENCE_TYPING:-}" = "1" ] || exit 0
 dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/discord"
 f="$dir/.presence-activity"
 mkdir -p "$dir"
-tmp="$f.tmp.$$"
-if [ "${1:-}" = "--clear" ]; then : > "$tmp"; else printf '%s' "${1:-}" > "$tmp"; fi
-mv -f "$tmp" "$f"
+case "${1:-}" in
+  --start) tmp="$f.tmp.$$"; printf '%s\n' "${2:-🐾 working…}" > "$tmp"; mv -f "$tmp" "$f" ;;
+  --idle)  tmp="$f.tmp.$$"; printf '%s\n' "💤 idle…"        > "$tmp"; mv -f "$tmp" "$f" ;;
+  *)       printf '%s\n' "${1:-}" >> "$f" ;;
+esac

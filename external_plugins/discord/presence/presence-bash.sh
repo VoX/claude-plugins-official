@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# PreToolUse[Bash] classifier → custom-status text. Reads the hook JSON on stdin.
-# No-op when presence is disabled; degrades to a generic label if jq is missing.
+# PreToolUse[Bash] classifier → appends a status to the per-turn sequence. No-op when presence
+# is disabled; degrades to a generic label if jq is missing.
 set -u
 [ "${DISCORD_PRESENCE_ACTIVITY:-}" = "1" ] || [ "${DISCORD_PRESENCE_TYPING:-}" = "1" ] || exit 0
 here="$(cd "$(dirname "$0")" && pwd)"

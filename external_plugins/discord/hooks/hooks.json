@@ -1,28 +1,20 @@
 {
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🐾 working…'" } ] }
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh --start '🐾 working…'" } ] }
     ],
     "PreToolUse": [
       { "matcher": "Read|WebFetch", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '📖 reading…'" } ] },
       { "matcher": "Grep|Glob|WebSearch", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🔍 searching…'" } ] },
       { "matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '✏️ editing…'" } ] },
-      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-bash.sh" } ] }
-    ],
-    "PostToolBatch": [
-      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🐾 working…'" } ] }
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-bash.sh" } ] },
+      { "matcher": "Task|Agent", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🤝 delegating…'" } ] }
     ],
     "PreCompact": [
       { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🔄 compacting…'" } ] }
     ],
-    "PostCompact": [
-      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🐾 working…'" } ] }
-    ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh --clear" } ] }
-    ],
-    "SubagentStop": [
-      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh --clear" } ] }
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh --idle" } ] }
     ]
   }
 }
