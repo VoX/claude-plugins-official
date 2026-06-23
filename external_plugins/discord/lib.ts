@@ -167,3 +167,32 @@ export function chunk(text: string, limit: number): string[] {
   if (rest) out.push(rest)
   return out
 }
+
+// ── Presence aggregation (pure; composes the per-turn action sequence) ──────────
+export const PRESENCE_IDLE = '💤 idle…'
+export const isIdle = (t: string) => /idle/i.test(t)
+export const isWorking = (t: string) => /working/i.test(t)
+
+// Compose the aggregate from the per-turn sequence file: the DISTINCT actions that fired
+// this turn, in first-occurrence order, space-joined with one trailing ellipsis. "working"
+// is dropped unless it's the only thing that fired; a single "idle" line is unique/terminal
+// (resting). '' for empty/absent. Parse/compose happens BEFORE sanitize (which strips the
+// newlines the sequence relies on).
+export function composePresence(raw: string): string {
+  const lines = raw.split('\n').map(l => l.trim()).filter(Boolean)
+  if (lines.length === 0) return ''
+  if (lines.some(isIdle)) return PRESENCE_IDLE
+  const seen = new Set<string>()
+  const distinct = lines.filter(l => (seen.has(l) ? false : (seen.add(l), true)))
+  let kept = distinct.filter(l => !isWorking(l))
+  if (kept.length === 0) kept = distinct.filter(isWorking).slice(0, 1)  // only working fired
+  if (kept.length === 0) return ''
+  const strip = (l: string) => l.replace(/[…．.\s]+$/u, '')
+  let body = kept.map(strip).join(' ')
+  while (body.length > 120 && kept.length > 1) {       // 128-char cap: drop oldest, prefix ellipsis
+    kept = kept.slice(1)
+    body = '… ' + kept.map(strip).join(' ')
+  }
+  return body + '…'
+}
+

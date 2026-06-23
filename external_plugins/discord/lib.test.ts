@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs } from './lib'
+import { safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, composePresence } from './lib'
 
 describe('safeSlice', () => {
   test('returns input unchanged when shorter than limit', () => {
@@ -223,5 +223,34 @@ describe('chunk', () => {
     const out = chunk('hello world', 5)
     expect(out[1]).toBe('world')
     expect(out[1].startsWith(' ')).toBe(false)
+  })
+})
+
+describe('composePresence', () => {
+  test('aggregates distinct actions in first-occurrence order, drops working', () => {
+    expect(composePresence('🐾 working…\n📖 reading…\n✏️ editing…\n')).toBe('📖 reading ✏️ editing…')
+  })
+  test('working shown only when it is the sole entry', () => {
+    expect(composePresence('🐾 working…\n')).toBe('🐾 working…')
+  })
+  test('dedupes repeated actions', () => {
+    expect(composePresence('🐾 working…\n📖 reading…\n📖 reading…\n✏️ editing…\n')).toBe('📖 reading ✏️ editing…')
+  })
+  test('keeps first-occurrence order when an action repeats later', () => {
+    expect(composePresence('🐾 working…\n📖 reading…\n✏️ editing…\n📖 reading…\n')).toBe('📖 reading ✏️ editing…')
+  })
+  test('full chain of distinct actions', () => {
+    expect(composePresence('🐾 working…\n📖 reading…\n✏️ editing…\n💾 committing…\n⬆️ pushing…\n'))
+      .toBe('📖 reading ✏️ editing 💾 committing ⬆️ pushing…')
+  })
+  test('idle is unique', () => {
+    expect(composePresence('💤 idle…\n')).toBe('💤 idle…')
+  })
+  test('idle overrides any accumulated actions (terminal)', () => {
+    expect(composePresence('🐾 working…\n📖 reading…\n💤 idle…\n')).toBe('💤 idle…')
+  })
+  test('empty / absent -> empty (resting, no text)', () => {
+    expect(composePresence('')).toBe('')
+    expect(composePresence('\n\n')).toBe('')
   })
 })

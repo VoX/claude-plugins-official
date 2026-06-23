@@ -42,7 +42,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, sep, dirname } from 'path'
 import sharp from 'sharp'
-import { safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS } from './lib'
+import { safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, isWorking, composePresence } from './lib'
 
 // Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
 // environment (only our systemd service sets it). Fresh claude CLI sessions
@@ -803,28 +803,51 @@ const PRESENCE_FILE = join(STATE_DIR, '.presence-activity')
 const PRESENCE_ACTIVITY = process.env.DISCORD_PRESENCE_ACTIVITY === '1'
 const PRESENCE_TYPING = process.env.DISCORD_PRESENCE_TYPING === '1'
 const PRESENCE_BACKSTOP_MS = 120_000
+const PRESENCE_MIN_INTERVAL_MS = 4_000   // floor between presence writes (Discord ~5/20s)
+const PRESENCE_IDLE_LINGER_MS = 4_000    // hold the final aggregate before settling to idle
 let presenceChannelId: string | null = null
 let lastPresenceText: string | null = null
-let presenceBackstop: ReturnType<typeof setTimeout> | null = null
-const PRESENCE_MIN_INTERVAL_MS = 12_000
-let lastPresenceSetAt = 0
 let pendingPresenceText: string | null = null
+let lastPresenceSetAt = 0
 let presenceFlush: ReturnType<typeof setTimeout> | null = null
+let presenceBackstop: ReturnType<typeof setTimeout> | null = null
+let presenceIdleLinger: ReturnType<typeof setTimeout> | null = null
 
 function sanitizeStatus(s: string): string {
   return s.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 128)
 }
 
-// Apply the current status text. '' clears both effects. Deduped so the 1s poll
-// doesn't re-issue identical setPresence/typing calls (also keeps us under the
-// presence rate limit).
+const isResting = (t: string) => t === '' || isIdle(t)
+
+
+// Apply a composed status. Resting ('' or idle) -> idle dot + stop typing; active aggregate ->
+// green dot + text. Throttled under Discord's ~5/20s presence limit: active growth coalesces
+// latest-wins (latest = most complete aggregate) within the floor; resting->active edges apply
+// immediately. On turn-end (->idle) the final aggregate is FLUSHED, then idle settles after a
+// short linger so a quick turn still shows what it did.
 function applyPresence(text: string): void {
   text = sanitizeStatus(text)
-  // Throttle: Discord drops presence updates over ~5/20s and discord.js does not
-  // rate-limit them, so tool-heavy turns would freeze the status. Coalesce non-empty
-  // updates to one per PRESENCE_MIN_INTERVAL_MS (latest wins); clears ('') go immediately.
   const now = Date.now()
-  if (text !== '' && now - lastPresenceSetAt < PRESENCE_MIN_INTERVAL_MS) {
+
+  if (isResting(text)) {
+    if (text === lastPresenceText) { lastPresenceSetAt = now; return }   // already idle: no-op
+    if (pendingPresenceText !== null) {                                  // flush final aggregate first
+      const agg = pendingPresenceText; pendingPresenceText = null
+      if (presenceFlush) { clearTimeout(presenceFlush); presenceFlush = null }
+      setPresenceNow(agg)
+    }
+    if (!presenceIdleLinger) {                                           // settle to idle once, no per-tick reset
+      presenceIdleLinger = setTimeout(() => { presenceIdleLinger = null; setPresenceNow(text) }, PRESENCE_IDLE_LINGER_MS)
+    }
+    return
+  }
+
+  // active: cancel a pending idle from the previous turn-end
+  if (presenceIdleLinger) { clearTimeout(presenceIdleLinger); presenceIdleLinger = null }
+
+  // coalesce active growth within the floor (keep the latest = most complete aggregate)
+  const lastActive = lastPresenceText !== null && !isResting(lastPresenceText)
+  if (lastActive && now - lastPresenceSetAt < PRESENCE_MIN_INTERVAL_MS) {
     pendingPresenceText = text
     if (!presenceFlush) presenceFlush = setTimeout(() => {
       presenceFlush = null
@@ -833,44 +856,47 @@ function applyPresence(text: string): void {
     }, PRESENCE_MIN_INTERVAL_MS - (now - lastPresenceSetAt))
     return
   }
+  setPresenceNow(text)
+}
+
+// The actual presence write (dot + activity text) + typing-stop + backstop. Deduped.
+function setPresenceNow(text: string): void {
   if (presenceFlush) { clearTimeout(presenceFlush); presenceFlush = null; pendingPresenceText = null }
-  if (text === lastPresenceText) { lastPresenceSetAt = now; return }
-  lastPresenceSetAt = now
+  if (text === lastPresenceText) return  // dedupe: don't bump lastPresenceSetAt on a no-op
+  lastPresenceSetAt = Date.now()
   lastPresenceText = text
+  const resting = isResting(text)
 
   if (PRESENCE_ACTIVITY && client.user) {
     try {
-      // status dot: online (green) while there's an active status, idle (yellow) when cleared
-      client.user.setPresence(text
-        ? { status: 'online', activities: [{ name: client.user.username, state: text, type: ActivityType.Custom }] }
-        : { status: 'idle', activities: [] })
+      // dot: green while active, yellow (idle) when resting; the text (incl. the idle label) shows when present.
+      client.user.setPresence({
+        status: resting ? 'idle' : 'online',
+        activities: text ? [{ name: client.user.username, state: text, type: ActivityType.Custom }] : [],
+      })
     } catch { /* presence set is best-effort */ }
   }
 
-  // Typing is *started* in handleInbound; here we only stop it on turn-end (file
-  // cleared by the Stop hook), then drop the channel so a stale one can't be
-  // re-typed on an unrelated turn.
-  if (PRESENCE_TYPING && !text && presenceChannelId) {
+  if (PRESENCE_TYPING && resting && presenceChannelId) {
     stopTyping(presenceChannelId)
     presenceChannelId = null
   }
 
   if (presenceBackstop) { clearTimeout(presenceBackstop); presenceBackstop = null }
-  if (text) presenceBackstop = setTimeout(() => {
-    try { writeFileSync(PRESENCE_FILE, '') } catch { /* best-effort */ }
-    applyPresence('')
+  if (!resting) presenceBackstop = setTimeout(() => {
+    try { writeFileSync(PRESENCE_FILE, PRESENCE_IDLE) } catch { /* best-effort */ }
+    applyPresence(PRESENCE_IDLE)
   }, PRESENCE_BACKSTOP_MS)
 }
 
-// Poll the control file ~1s and apply. Reads every tick (no mtime gate — back-to-
-// back writes can share an mtime); the dedupe above keeps it cheap.
+// Poll the sequence file ~1s, compose the aggregate, and apply.
 function startPresenceWatcher(): void {
   if (!PRESENCE_ACTIVITY && !PRESENCE_TYPING) return
-  applyPresence('')  // clear any stale status from a mid-turn restart
+  setPresenceNow('')  // clear any stale status from a mid-turn restart
   setInterval(() => {
-    let text = ''
-    try { text = readFileSync(PRESENCE_FILE, 'utf8') } catch { /* absent = cleared */ }
-    applyPresence(text)
+    let raw = ''
+    try { raw = readFileSync(PRESENCE_FILE, 'utf8') } catch { /* absent = resting */ }
+    applyPresence(composePresence(raw))
   }, 1000)
 }
 
