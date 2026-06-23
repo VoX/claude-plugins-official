@@ -9,6 +9,11 @@ if command -v jq >/dev/null 2>&1; then cmd="$(jq -r '.tool_input.command // ""' 
 case "$cmd" in
   *"git push"*)   t="⬆️ pushing…";;
   *"git commit"*) t="💾 committing…";;
-  *)              t="⚙️ running…";;
+  *)
+    first="${cmd%%[[:space:]]*}"   # first token of the command
+    first="${first##*/}"           # basename (drop any leading path)
+    first="${first:0:24}"          # cap length
+    if [ -n "$first" ]; then t="⚙️ run ${first}…"; else t="⚙️ running…"; fi
+    ;;
 esac
 exec bash "$here/presence-status.sh" "$t"
