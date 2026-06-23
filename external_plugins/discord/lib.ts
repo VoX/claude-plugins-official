@@ -170,8 +170,10 @@ export function chunk(text: string, limit: number): string[] {
 
 // ── Presence aggregation (pure; composes the per-turn action sequence) ──────────
 export const PRESENCE_IDLE = '💤 idle…'
-export const isIdle = (t: string) => /idle/i.test(t)
-export const isWorking = (t: string) => /working/i.test(t)
+// Match the sentinel by its EMOJI marker, not the word — so a Bash classifier label like
+// "⚙️ run idle…" (a command named "idle") isn't mistaken for the rest/working sentinel.
+export const isIdle = (t: string) => t.includes('💤')
+export const isWorking = (t: string) => t.includes('🐾')
 
 // Compose the aggregate from the per-turn sequence file: the DISTINCT actions that fired
 // this turn, in first-occurrence order, space-joined with one trailing ellipsis. "working"

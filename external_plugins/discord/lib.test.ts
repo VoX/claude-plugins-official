@@ -266,4 +266,8 @@ describe('composePresence', () => {
   test('the live-poison shape (idle first, work after) recovers to active', () => {
     expect(composePresence('💤 idle…\n🤝 delegating…\n📖 reading…\n📖 reading…\n')).toBe('🤝 delegating 📖 reading…')
   })
+  test('a "run <name>" label whose name is idle/working is NOT a sentinel (emoji-matched)', () => {
+    expect(composePresence('🐾 working…\n⚙️ run idle…\n')).toBe('⚙️ run idle…')
+    expect(composePresence('🐾 working…\n⚙️ run working…\n')).toBe('⚙️ run working…')
+  })
 })

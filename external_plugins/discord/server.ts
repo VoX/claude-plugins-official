@@ -802,14 +802,15 @@ function stopTyping(chatId: string): void {
 const PRESENCE_FILE = join(STATE_DIR, '.presence-activity')
 const PRESENCE_ACTIVITY = process.env.DISCORD_PRESENCE_ACTIVITY === '1'
 const PRESENCE_TYPING = process.env.DISCORD_PRESENCE_TYPING === '1'
-const PRESENCE_POLL_MS = 250             // detect new events fast (publish cadence governed by the timers below)
+const PRESENCE_POLL_MS = 250             // detect new events fast (publish cadence governed by the limiter below)
 const PRESENCE_DEBOUNCE_MS = 1_000       // after the first event, wait 1s accumulating before publishing
-const PRESENCE_COOLDOWN_MS = 4_500       // min gap between publishes (≈Discord's 5/20s limit); ALL writes respect it
+const PRESENCE_WINDOW_MS = 20_000        // Discord's presence limit window
+const PRESENCE_WINDOW_MAX = 5            // ...5 updates per 20s — honored exactly via a sliding window
 let presenceChannelId: string | null = null
 let lastPresenceText: string | null = null
 let presenceShownLines = 0               // high-water mark: sequence lines already published
 let lastRawSeen = ''                     // detect file replacement (--start) vs append
-let lastPublishAt = 0                    // epoch ms of last actual publish (cooldown anchor; epoch 0 = long ago)
+let presenceWrites: number[] = []        // epoch ms of recent publishes (pruned to the trailing window)
 let firstPendingAt = 0                   // epoch ms the current un-published batch's first event arrived
 
 function sanitizeStatus(s: string): string {
@@ -820,7 +821,7 @@ const isResting = (t: string) => t === '' || isIdle(t)
 
 
 // The actual presence write (dot + activity text) + typing-stop. Deduped. Returns true iff an
-// actual wire write happened (so the caller only advances the cooldown on a real publish).
+// actual wire write happened (so the caller only consumes a rate-limit slot on a real publish).
 function setPresenceNow(text: string): boolean {
   text = sanitizeStatus(text)
   if (text === lastPresenceText) return false  // dedupe: no wire write
@@ -844,16 +845,17 @@ function setPresenceNow(text: string): boolean {
   return true
 }
 
-// Poll the sequence file (~250ms) and publish per VoX's two-timer model. Each publish shows the
-// distinct actions appended SINCE THE LAST PUBLISH (advancing presenceShownLines), so the status
-// tracks what's happening NOW, not a whole-turn aggregate. publishAt = max(firstEventOfBatch +
-// DEBOUNCE, lastPublish + COOLDOWN): a fresh batch waits 1s to accumulate, then publishes; the 4.5s
-// cooldown (≈Discord's 5/20s limit) gates EVERY publish — including turn-end idle, which is just
-// another publish (no bypass), so we can't exceed the limit. When actions and a trailing idle are both
-// unshown (a quick turn), the actions publish first and the idle line is left for the next publish, so
-// the final action shows then the dot settles to idle one cooldown later. A file replacement (--start,
-// detected via !startsWith) resets the high-water mark. No staleness backstop: a long single op holds
-// its status (idle comes only from the Stop hook, which appends idle as the last line).
+// Poll the sequence file (~250ms) and publish per VoX's model. Each publish shows the distinct actions
+// appended SINCE THE LAST PUBLISH (advancing presenceShownLines), so the status tracks what's happening
+// NOW, not a whole-turn aggregate. publishAt = max(firstEventOfBatch + DEBOUNCE, windowReadyAt): a fresh
+// batch waits 1s to accumulate, then publishes as soon as the sliding rate-limit window has room. The
+// window honors Discord's exact limit (≤PRESENCE_WINDOW_MAX publishes per PRESENCE_WINDOW_MS): up to 5
+// updates show back-to-back (snappy — most turns have ≤5 distinct actions), and only once 5 are used in
+// the trailing 20s does the next wait for the oldest to age out. EVERY publish (incl. turn-end idle)
+// goes through the window, so the limit can't be exceeded. When actions and a trailing idle are both
+// unshown (a quick turn), the actions publish first and the idle line is left for the next slot, so the
+// final action shows then the dot settles to idle. A file replacement (--start, !startsWith) resets the
+// high-water mark. No staleness backstop: a long single op holds its status (idle comes only from Stop).
 function tickPresence(): void {
   let raw = ''
   try { raw = readFileSync(PRESENCE_FILE, 'utf8') } catch { /* absent = resting */ }
@@ -872,20 +874,23 @@ function tickPresence(): void {
   if (tail.length === 0) { firstPendingAt = 0; return }        // nothing new → hold current display
 
   if (firstPendingAt === 0) firstPendingAt = now               // first event of this batch
-  const readyAt = Math.max(firstPendingAt + PRESENCE_DEBOUNCE_MS, lastPublishAt + PRESENCE_COOLDOWN_MS)
-  if (now < readyAt) return                                    // debounce/cooldown not elapsed → accumulate
+  // sliding-window rate limit: prune writes older than the window; if it's full, wait for the oldest to age out.
+  while (presenceWrites.length && presenceWrites[0]! <= now - PRESENCE_WINDOW_MS) presenceWrites.shift()
+  const windowReadyAt = presenceWrites.length < PRESENCE_WINDOW_MAX ? 0 : presenceWrites[0]! + PRESENCE_WINDOW_MS
+  const readyAt = Math.max(firstPendingAt + PRESENCE_DEBOUNCE_MS, windowReadyAt)
+  if (now < readyAt) return                                    // debounce or window not ready → accumulate
 
   // Split: unshown ACTIONS (drop a trailing idle + any stray idle) vs a trailing idle marker.
   const trailingIdle = isIdle(tail[tail.length - 1]!)
   const actions = (trailingIdle ? tail.slice(0, -1) : tail).filter(l => !isIdle(l))
   if (actions.length) {
-    // publish the actions; if a trailing idle is also pending, leave it unshown so idle settles next cooldown
+    // publish the actions; if a trailing idle is also pending, leave it unshown so idle settles next slot
     const batch = composePresence(actions.join('\n'))
-    if (batch && setPresenceNow(batch)) lastPublishAt = now
+    if (batch && setPresenceNow(batch)) presenceWrites.push(now)
     presenceShownLines = lines.length - (trailingIdle ? 1 : 0)
   } else if (trailingIdle) {
-    // only the idle marker is unshown → settle the dot to idle (still cooldown-gated above)
-    if (setPresenceNow(PRESENCE_IDLE)) lastPublishAt = now
+    // only the idle marker is unshown → settle the dot to idle (still window-gated above)
+    if (setPresenceNow(PRESENCE_IDLE)) presenceWrites.push(now)
     presenceShownLines = lines.length
   } else {
     presenceShownLines = lines.length                          // nothing showable (e.g. stray idle only)
