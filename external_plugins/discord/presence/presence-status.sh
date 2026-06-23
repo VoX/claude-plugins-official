@@ -4,11 +4,11 @@
 #   presence-status.sh "📖 reading…"            append an action (PreToolUse)
 #   presence-status.sh --idle                   end the turn (Stop) → idle
 # No-op unless a presence effect is enabled (plugin hooks are always-on). Appends are a single
-# atomic O_APPEND write so parallel tool hooks can't clobber each other's lines; --start/--idle
-# atomically replace the whole file (tmp+mv).
+# atomic O_APPEND write so parallel tool hooks can't clobber each other's lines; --start
+# atomically replaces the whole file (tmp+mv); --idle appends (so a final action isn't lost).
 set -u
 [ "${DISCORD_PRESENCE_ACTIVITY:-}" = "1" ] || [ "${DISCORD_PRESENCE_TYPING:-}" = "1" ] || exit 0
-dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/discord"
+dir="${DISCORD_STATE_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/discord}"
 f="$dir/.presence-activity"
 mkdir -p "$dir"
 case "${1:-}" in
