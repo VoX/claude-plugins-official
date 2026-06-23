@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🐾 working…'" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Read|WebFetch", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '📖 reading…'" } ] },
+      { "matcher": "Grep|Glob|WebSearch", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🔍 searching…'" } ] },
+      { "matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '✏️ editing…'" } ] },
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-bash.sh" } ] }
+    ],
+    "PostToolBatch": [
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🐾 working…'" } ] }
+    ],
+    "PreCompact": [
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🔄 compacting…'" } ] }
+    ],
+    "PostCompact": [
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🐾 working…'" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh --clear" } ] }
+    ],
+    "SubagentStop": [
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh --clear" } ] }
+    ]
+  }
+}
