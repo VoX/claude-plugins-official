@@ -840,9 +840,10 @@ function applyPresence(text: string): void {
 
   if (PRESENCE_ACTIVITY && client.user) {
     try {
+      // status dot: online (green) while there's an active status, idle (yellow) when cleared
       client.user.setPresence(text
-        ? { activities: [{ name: client.user.username, state: text, type: ActivityType.Custom }] }
-        : { activities: [] })
+        ? { status: 'online', activities: [{ name: client.user.username, state: text, type: ActivityType.Custom }] }
+        : { status: 'idle', activities: [] })
     } catch { /* presence set is best-effort */ }
   }
 
