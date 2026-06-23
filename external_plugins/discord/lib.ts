@@ -175,15 +175,21 @@ export const isWorking = (t: string) => /working/i.test(t)
 
 // Compose the aggregate from the per-turn sequence file: the DISTINCT actions that fired
 // this turn, in first-occurrence order, space-joined with one trailing ellipsis. "working"
-// is dropped unless it's the only thing that fired; a single "idle" line is unique/terminal
-// (resting). '' for empty/absent. Parse/compose happens BEFORE sanitize (which strips the
-// newlines the sequence relies on).
+// is dropped unless it's the only thing that fired; '' for empty/absent. Parse/compose happens
+// BEFORE sanitize (which strips the newlines the sequence relies on).
+//
+// idle is terminal but ORDER-AUTHORITATIVE: it only rests if it's the LAST line. A tool append
+// landing after the Stop hook's idle write (a parallel-hook race) means work actually continued,
+// so we show the work and ignore the stray non-trailing idle — making the reader self-correcting
+// regardless of write ordering.
 export function composePresence(raw: string): string {
   const lines = raw.split('\n').map(l => l.trim()).filter(Boolean)
   if (lines.length === 0) return ''
-  if (lines.some(isIdle)) return PRESENCE_IDLE
+  if (isIdle(lines[lines.length - 1]!)) return PRESENCE_IDLE
+  const actions = lines.filter(l => !isIdle(l))  // drop stray (non-trailing) idle lines from races
+  if (actions.length === 0) return ''
   const seen = new Set<string>()
-  const distinct = lines.filter(l => (seen.has(l) ? false : (seen.add(l), true)))
+  const distinct = actions.filter(l => (seen.has(l) ? false : (seen.add(l), true)))
   let kept = distinct.filter(l => !isWorking(l))
   if (kept.length === 0) kept = distinct.filter(isWorking).slice(0, 1)  // only working fired
   if (kept.length === 0) return ''
