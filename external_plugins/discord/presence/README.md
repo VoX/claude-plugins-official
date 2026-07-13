@@ -25,11 +25,18 @@ they're shown together (e.g. `📖 reading ✏️ editing…`); otherwise each s
 
 - `--start "🐾 working…"` (UserPromptSubmit) resets the sequence each turn.
 - each PreToolUse **appends** its action: 📖 reading (Read/WebFetch), 🔍 searching (Grep/Glob/WebSearch),
-  ✏️ editing (Edit/Write/MultiEdit/NotebookEdit), ⚙️ run <cmd> / ⬆️ pushing / 💾 committing (Bash, classified),
+  ✏️ editing (Edit/Write/MultiEdit/NotebookEdit), a **classified verb** (Bash — see below),
   🤝 delegating (Task/Agent subagent), 💬 replying (Discord reply/embed/voice), 🔄 compacting (PreCompact).
-- the Bash classifier names the command: `npm ci` → `⚙️ run npm…`; on a chain it names the **rightmost**
-  segment (the actual work), skipping `VAR=…`/`sudo`/`env` prefixes and `cd` setup — `cd /x && npm ci` →
-  `run npm`, `make && ./deploy.sh` → `run deploy.sh`. A trailing `&& echo …` confirmation is skipped, and a bare `cd` writes nothing.
+- the Bash classifier maps the command to what it **does**, not which binary ran — deliberately reusing
+  the tool-level verbs so shell work dedupes against the tools: `cat`/`head`/`sed` → 📖 reading,
+  `grep`/`find`/`ls` → 🔍 searching, `npm`/`make`/`cargo` → 🔧 building, `pytest`/`npm test` → 🧪 testing,
+  `curl`/`gh`/`ssh` → 🌐 fetching, `pip`/`apt`/`npm ci` → 📦 installing, `git push`/`git commit` →
+  ⬆️ pushing / 💾 committing, `systemctl`/`docker` → 🛠️ ops. A genuinely distinctive command keeps its
+  name — `./deploy.sh` → `⚙️ run deploy.sh…` — so `run <cmd>` is now a *signal* (something unusual is
+  running), not a firehose of `run head/cat/grep`. On a chain it classifies the **rightmost** segment
+  (the actual work), skipping `VAR=…`/`sudo`/`env` prefixes and `cd` setup — `cd /x && npm ci` → 📦 installing.
+  git subcommands are read from the parsed arg, not a substring, so `grep "git push"` is 🔍 searching, not a
+  false ⬆️ pushing. A trailing `&& echo …` confirmation is skipped, and a bare `cd` writes nothing.
 - composition: **distinct** (deduped), first-occurrence order, space-joined with one trailing "…".
   "🐾 working…" shows only if it's the only thing that fired. Sentinels match by emoji (🐾/💤), so a
   command literally named "idle"/"working" isn't mistaken for one.
@@ -37,7 +44,10 @@ they're shown together (e.g. `📖 reading ✏️ editing…`); otherwise each s
 
 Dot + typing: green/online while active, yellow/idle when resting; typing (if enabled) starts on a real
 Discord inbound and stops when the turn idles. Publishes go through a **sliding-window rate limiter** —
-≤5 updates per 20s (Discord's exact presence limit), so a busy turn batches rather than getting dropped.
+≤5 updates per 20s (a conservative self-limit; Discord's documented gateway cap is 120 events/60s and the
+presence-specific threshold is undocumented — excess presence updates are silently dropped, which is why
+self-limiting is load-bearing: a dropped final publish would freeze a stale status), so a busy turn
+batches rather than getting dropped.
 No staleness backstop: a long single operation holds its status (idle comes only from the Stop hook); a
 missed Stop is recovered by the next turn's `--start` or the on-restart startup-clear.
 
@@ -52,4 +62,6 @@ missed Stop is recovered by the next turn's `--start` or the on-restart startup-
 ## Files
 - `hooks/hooks.json` — the auto-registered hooks (reference scripts via `${CLAUDE_PLUGIN_ROOT}`).
 - `presence/presence-status.sh` — sequence writer (`--start` / append / `--idle`), self-gated, atomic.
-- `presence/presence-bash.sh` — Bash classifier (`run <cmd>`, git push/commit → pushing/committing…).
+- `presence/presence-bash.sh` — Bash classifier: resolves the rightmost command + subcommand and maps it
+  to an activity verb (reading/searching/building/testing/fetching/installing/pushing/committing/ops),
+  reserving `⚙️ run <cmd>…` for distinctive commands. Tested in `presence/presence-bash.test.ts`.

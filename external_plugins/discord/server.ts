@@ -794,6 +794,13 @@ function stopTyping(chatId: string): void {
   }
 }
 
+// Stop typing in EVERY channel. presenceChannelId only tracks the latest inbound, so a second
+// inbound before the turn rests would otherwise leave the first channel's 9s typing loop running
+// forever. On rest we clear them all.
+function stopAllTyping(): void {
+  for (const chatId of [...typingIntervals.keys()]) stopTyping(chatId)
+}
+
 // ── Auto-presence (opt-in; the activity + typing flags are independent) ────────
 // The custom-status TEXT is driven by a control file that Claude Code hooks write
 // (working…/editing…/pushing…; the Stop hook clears it); the watcher applies it.
@@ -814,7 +821,10 @@ let presenceWrites: number[] = []        // epoch ms of recent publishes (pruned
 let firstPendingAt = 0                   // epoch ms the current un-published batch's first event arrived
 
 function sanitizeStatus(s: string): string {
-  return s.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 128)
+  const cleaned = s.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()
+  // safeSlice (codepoint-aware) not raw .slice — a 128-UTF16-unit cut can strand a lone
+  // surrogate half of a trailing emoji, producing a � or a rejected gateway payload.
+  return safeSlice(cleaned, 128)
 }
 
 const isResting = (t: string) => t === '' || isIdle(t)
@@ -838,8 +848,8 @@ function setPresenceNow(text: string): boolean {
     } catch { /* presence set is best-effort */ }
   }
 
-  if (PRESENCE_TYPING && resting && presenceChannelId) {
-    stopTyping(presenceChannelId)
+  if (PRESENCE_TYPING && resting) {
+    stopAllTyping()          // not just presenceChannelId — clear typing in every channel on rest
     presenceChannelId = null
   }
   return true
@@ -901,6 +911,16 @@ function tickPresence(): void {
 function startPresenceWatcher(): void {
   if (!PRESENCE_ACTIVITY && !PRESENCE_TYPING) return
   setPresenceNow('')  // clear any stale status from a mid-turn restart
+  // Baseline any pre-restart sequence file as already-shown. Without this, lastRawSeen='' makes
+  // raw.startsWith(lastRawSeen) always true, so the stale file never reads as "replaced" and its
+  // whole action trail publishes as an unshown tail ~1s after startup — the status would replay a
+  // dead turn (📖 reading ✏️ editing 💾 committing…) while the bot is idle. The next turn's --start
+  // replaces the file and resets cleanly.
+  try {
+    const raw = readFileSync(PRESENCE_FILE, 'utf8')
+    lastRawSeen = raw
+    presenceShownLines = raw.split('\n').map(l => l.trim()).filter(Boolean).length
+  } catch { /* no file → clean slate (lastRawSeen='' already) */ }
   setInterval(tickPresence, PRESENCE_POLL_MS)
 }
 
