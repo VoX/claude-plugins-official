@@ -100,8 +100,8 @@ Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mo
 | `typing` | Show "bot is typing…" in a channel until a message is sent. Takes `chat_id`. The assistant calls this when it decides an inbound message needs a response, before doing the work. |
 | `fetch_messages` | Pull recent history from a channel (oldest-first). Capped at 100 per call. Each line includes the message ID so the model can `reply_to` it; messages with attachments are marked `+Natt`. Discord's search API isn't exposed to bots, so this is the only lookback. |
 | `download_attachment` | Download all attachments from a specific message by ID to `~/.claude/channels/discord/inbox/`. Optional `dest_dir` copies files to a target directory. Returns file paths + metadata. Use when `fetch_messages` shows a message has attachments. |
-| `get_server_spec` | Read a guild's structure as a spec object: `everyone_permissions`, roles (name/color/hoist/mentionable/permissions/position), categories with their channels (name/kind/topic/slowmode/nsfw/overwrites), plus a `bot` section (this bot's highest role position and which admin permissions it holds). Read-only; output is exactly what `apply_server_spec` consumes. |
-| `apply_server_spec` | Apply a server spec to a guild — additive upsert (create/update only, **never deletes**). Renders a diff and DMs it to `DISCORD_OWNER_ID` with Allow/Deny buttons; blocks until they decide (5-min timeout = deny). `dry_run: true` returns the diff without approval or changes. See [Server admin tools](#server-admin-tools). |
+| `get_server_spec` | Read a guild's structure as a spec object: `everyone_permissions`, roles (name/color/hoist/mentionable/permissions/position), categories with their channels (name/kind/topic/slowmode/nsfw/overwrites), plus a `bot` section (this bot's highest role position and which admin permissions it holds). Every entry carries its snowflake `id` for `apply_server_spec`'s rename/move matching. Read-only; output is exactly what `apply_server_spec` consumes. |
+| `apply_server_spec` | Apply a server spec to a guild — additive upsert (create/update only, **never deletes** by default). Entries that keep their `id` are renamed/moved in place instead of recreated. `prune: true` turns the apply into a full reconcile that deletes unclaimed entities (never `@everyone`, managed roles, or the bot's own role). Renders a diff and DMs it to `DISCORD_OWNER_ID` with Allow/Deny buttons; blocks until they decide (5-min timeout = deny). `dry_run: true` returns the diff without approval or changes. See [Server admin tools](#server-admin-tools). |
 
 The `typing` tool lets the assistant show a typing indicator manually —
 the bot does not auto-type on every inbound message (that made it look
@@ -164,9 +164,41 @@ reordered.
 
 **Additive semantics.** `apply_server_spec` diffs the spec against the live
 guild and upserts: missing things are created, drifted spec-set fields are
-updated, and anything the spec doesn't mention is *left untouched* — the tool
-never deletes or moves existing roles/channels. Fields omitted from a spec
-entry aren't compared. Re-applying a matching spec yields an empty diff.
+updated, and anything the spec doesn't mention is *left untouched* — by
+default the tool never deletes existing roles/channels. Fields omitted from a
+spec entry aren't compared. Re-applying a matching spec yields an empty diff.
+
+**Ids, renames, and moves.** `get_server_spec` emits each role/category/
+channel's snowflake as an `id` field. Entries that keep their `id` are
+matched by snowflake instead of name: change the entry's `name` and the live
+entity is **renamed in place** (`setName`), move a channel under a different
+category (or to top-level) and it's **moved** (`setParent`, keeping its own
+permission overwrites) — never delete+create, so history, pins, and
+permissions survive. The workflow: export with `get_server_spec`, edit names
+and placement, apply — keep the ids. A stale or foreign id is a hint, not a
+requirement: the entry falls back to name matching, then to create; unknown
+ids never error. Id-less entries behave exactly as before (name matching).
+
+**Prune (full reconcile).** `prune: true` makes the apply also **delete**
+live roles/categories/channels no spec entry claims (an entity is claimed
+when a spec entry carries its id, or — for id-less entries — matches its
+name+location). Deletions run after all creates/updates/renames/moves, in
+safe order: child channels → their now-empty categories → roles. Three
+things can **never** be deleted, spec or no spec: `@everyone`, managed roles
+(bot/integration/booster roles), and the bot's own role. Deletions Discord
+itself blocks (e.g. a Community server's rules/updates channel) are reported
+`✗` per entry without aborting the rest.
+
+The rendered diff makes prunes loud: the header counts deletions first
+(`⚠ 2 DELETIONS · 1 create · …`), each one renders as `- DELETE <entity>`,
+and when deletions exceed the guard threshold (more than 5, or more than 50%
+of the guild's channels) the diff carries a `⚠⚠ LARGE PRUNE` banner. The
+banner is display-only — same single approval — but impossible to miss.
+
+> **Footgun:** a partial hand-authored spec + `prune` = mass-delete of
+> everything the spec omits. Always start from a fresh `get_server_spec`
+> export when pruning. The opt-in flag, the owner-approval diff, and the
+> banner exist to catch this — read the diff before clicking Allow.
 
 **Owner approval.** Every mutating apply DMs the rendered diff (as a text
 attachment) to the user in `DISCORD_OWNER_ID` with Allow / Deny buttons and
@@ -193,6 +225,10 @@ grant/remove parts of the `/discord:access` skill — see
 [ACCESS.md](./ACCESS.md#the-access-slash-command).
 
 ## Changelog
+
+### 0.4.0
+- `get_server_spec` now emits each role/category/channel's snowflake as `id`; `apply_server_spec` matches id-carrying entries by snowflake, so a changed name **renames** the live entity in place and a re-parented channel **moves** (`setParent`, own overwrites kept) — no more delete+create. Stale/foreign ids fall back to name matching, never error.
+- New `apply_server_spec` `prune` flag (default off): full reconcile that deletes live entities the spec doesn't claim, ordered channels → empty categories → roles. `@everyone`, managed roles, and the bot's own role are never deleted. Diff header counts deletions first, each renders as `- DELETE`, and > 5 deletions (or > 50% of the guild's channels) adds a `⚠⚠ LARGE PRUNE` banner.
 
 ### 0.3.0
 - New `get_server_spec` / `apply_server_spec` tools: read a guild's structure as a declarative spec; apply one additively with an owner-approved diff (Allow/Deny DM buttons, dangerous-grant ⚠ flags, `dry_run` preview). New `DISCORD_OWNER_ID` env var (fail-closed for mutations).

@@ -360,11 +360,18 @@ describe('buildServerSpec', () => {
 
   test('serializes role fields, omitting defaults', () => {
     const mod = spec.roles![0]!
-    expect(mod).toEqual({ name: 'Mod', color: '#5865f2', hoist: true, permissions: ['KickMembers', 'ViewChannel'], position: 2 })
+    expect(mod).toEqual({ name: 'Mod', id: 'r1', color: '#5865f2', hoist: true, permissions: ['KickMembers', 'ViewChannel'], position: 2 })
     const member = spec.roles![1]!
     expect(member.color).toBeUndefined()   // #000000 = no color
     expect(member.hoist).toBeUndefined()
     expect(member.mentionable).toBe(true)
+  })
+
+  test('emits the Discord snowflake as id on roles, categories, and channels', () => {
+    expect(spec.roles!.map(r => r.id)).toEqual(['r1', 'r2'])
+    expect(spec.categories![0]!.id).toBe('c1')
+    expect(spec.categories![0]!.channels![0]!.id).toBe('c2')
+    expect(spec.channels![0]!.id).toBe('c3')
   })
 
   test('nests channels under their category, keeps top-level channels separate', () => {
@@ -554,6 +561,152 @@ describe('computeSpecDiff', () => {
   })
 })
 
+describe('computeSpecDiff — id matching & prune', () => {
+  const currentSpec = () => buildServerSpec(fixtureState())
+  // The never-delete context server.ts passes: guild id (=@everyone),
+  // managed role ids, the bot's own role ids.
+  const pruneOpts = { prune: true, guildId: 'g1', managedRoleIds: ['r3'], botRoleIds: [] }
+
+  test('id kept + name changed → rename op, not delete+create', () => {
+    const diff = computeSpecDiff(currentSpec(), { roles: [{ id: 'r1', name: 'Moderator' }] })
+    expect(diff.entries).toHaveLength(1)
+    expect(diff.entries[0]!).toMatchObject({ kind: 'role', op: 'rename', id: 'r1', name: 'Moderator' })
+    expect(diff.entries[0]!.changes).toEqual([{ field: 'name', before: 'Mod', after: 'Moderator' }])
+  })
+
+  test('channel rename rides alongside field drift; renames sort after updates', () => {
+    const diff = computeSpecDiff(currentSpec(), {
+      categories: [{ id: 'c1', name: 'Staff', channels: [{ id: 'c2', name: 'mod-logs', topic: 'new topic' }] }],
+    })
+    expect(diff.entries.map(e => e.op)).toEqual(['modify', 'rename'])
+    expect(diff.entries[0]!).toMatchObject({ kind: 'channel', op: 'modify', id: 'c2', name: 'mod-logs' })
+    expect(diff.entries[0]!.changes).toEqual([{ field: 'topic', before: 'mod actions', after: 'new topic' }])
+    expect(diff.entries[1]!.changes).toEqual([{ field: 'name', before: 'mod-log', after: 'mod-logs' }])
+  })
+
+  test('id kept + parent changed → move op', () => {
+    const diff = computeSpecDiff(currentSpec(), {
+      categories: [{ id: 'c1', name: 'Staff', channels: [{ id: 'c3', name: 'lobby' }] }],
+    })
+    expect(diff.entries).toHaveLength(1)
+    expect(diff.entries[0]!).toMatchObject({ kind: 'channel', op: 'move', id: 'c3', name: 'lobby', category: 'Staff' })
+    expect(diff.entries[0]!.changes).toEqual([{ field: 'category', before: '(top-level)', after: 'Staff' }])
+  })
+
+  test('move to top-level (parent → null)', () => {
+    const diff = computeSpecDiff(currentSpec(), { channels: [{ id: 'c2', name: 'mod-log' }] })
+    expect(diff.entries).toHaveLength(1)
+    expect(diff.entries[0]!).toMatchObject({ kind: 'channel', op: 'move', id: 'c2', category: null })
+    expect(diff.entries[0]!.changes).toEqual([{ field: 'category', before: 'Staff', after: '(top-level)' }])
+  })
+
+  test('stale/foreign id falls back to name match — no throw, no create', () => {
+    const diff = computeSpecDiff(currentSpec(), { roles: [{ id: '999999', name: 'Mod', hoist: false }] })
+    expect(diff.entries).toHaveLength(1)
+    expect(diff.entries[0]!).toMatchObject({ kind: 'role', op: 'modify', id: 'r1', name: 'Mod' })
+    expect(diff.entries[0]!.changes).toEqual([{ field: 'hoist', before: true, after: false }])
+  })
+
+  test('stale id with no name match → create', () => {
+    const diff = computeSpecDiff(currentSpec(), { roles: [{ id: '999999', name: 'Brand New' }] })
+    expect(diff.entries).toHaveLength(1)
+    expect(diff.entries[0]!).toMatchObject({ kind: 'role', op: 'create', name: 'Brand New' })
+  })
+
+  test('mixed spec: id entries and name entries route independently', () => {
+    const diff = computeSpecDiff(currentSpec(), {
+      roles: [
+        { id: 'r1', name: 'Moderator' },          // id-match → rename
+        { name: 'Member', mentionable: false },   // name-match → modify
+        { name: 'Newbie' },                       // no match → create
+      ],
+    })
+    expect(diff.entries.map(e => `${e.op}:${e.name}`)).toEqual(['modify:Member', 'create:Newbie', 'rename:Moderator'])
+  })
+
+  test('category rename keeps id-less children matched (identity, not name)', () => {
+    // Under pure name-keying, renaming "Staff" would strand its children:
+    // the spec's child sits under a category name no live channel has, so
+    // it would read as a create (and its live twin as a prune-delete).
+    const diff = computeSpecDiff(currentSpec(), {
+      everyone_permissions: ['SendMessages', 'ViewChannel'],
+      roles: [{ id: 'r1', name: 'Mod' }, { id: 'r2', name: 'Member' }],
+      categories: [{ id: 'c1', name: 'Team Rooms', channels: [{ name: 'mod-log' }] }],
+      channels: [{ id: 'c3', name: 'lobby' }],
+    }, pruneOpts)
+    expect(diff.entries).toHaveLength(1)
+    expect(diff.entries[0]!).toMatchObject({ kind: 'category', op: 'rename', id: 'c1', name: 'Team Rooms' })
+  })
+
+  test('prune: unclaimed live ids become deletes, claimed survive', () => {
+    const diff = computeSpecDiff(currentSpec(), {
+      everyone_permissions: ['SendMessages', 'ViewChannel'],
+      roles: [{ id: 'r1', name: 'Mod' }],
+      categories: [{ id: 'c1', name: 'Staff', channels: [{ id: 'c2', name: 'mod-log' }] }],
+    }, pruneOpts)
+    expect(diff.entries.map(e => `${e.op}:${e.kind}:${e.name}`)).toEqual(['delete:channel:lobby', 'delete:role:Member'])
+  })
+
+  test('prune + id name-swap of two channels → two renames, zero deletes', () => {
+    // Pure name-keying would read a swap as both channels drifting (or as
+    // delete+create pairs under prune) — ids disambiguate.
+    const state = fixtureState()
+    state.channels.push({ id: 'c4', name: 'general', type: 0, parentId: 'c1', position: 1, topic: null, rateLimitPerUser: null, nsfw: false, overwrites: [] })
+    const diff = computeSpecDiff(buildServerSpec(state), {
+      everyone_permissions: ['SendMessages', 'ViewChannel'],
+      roles: [{ id: 'r1', name: 'Mod' }, { id: 'r2', name: 'Member' }],
+      categories: [{ id: 'c1', name: 'Staff', channels: [
+        { id: 'c2', name: 'general' },   // was mod-log
+        { id: 'c4', name: 'mod-log' },   // was general
+      ] }],
+      channels: [{ id: 'c3', name: 'lobby' }],
+    }, pruneOpts)
+    expect(diff.entries.map(e => e.op)).toEqual(['rename', 'rename'])
+    expect(diff.entries.map(e => `${e.id}:${e.name}`).sort()).toEqual(['c2:general', 'c4:mod-log'])
+  })
+
+  test('never-delete: @everyone / managed / bot-own roles survive prune even when unclaimed', () => {
+    // Hand-built current so the protected roles are present at all —
+    // buildServerSpec already keeps managed roles and @everyone out of specs.
+    const cur: ServerSpec = {
+      roles: [
+        { id: 'g1', name: 'everyone-ish' },   // id === guild id
+        { id: 'rM', name: 'SomeBot' },        // managed
+        { id: 'rB', name: 'BotsOwnRole' },    // held by the bot
+        { id: 'rX', name: 'Doomed' },
+      ],
+    }
+    const diff = computeSpecDiff(cur, {}, { prune: true, guildId: 'g1', managedRoleIds: ['rM'], botRoleIds: ['rB'] })
+    expect(diff.entries.map(e => `${e.op}:${e.id}`)).toEqual(['delete:rX'])
+    expect(diff.untouched).toContain('role "everyone-ish" (protected)')
+    expect(diff.untouched).toContain('role "SomeBot" (protected)')
+    expect(diff.untouched).toContain('role "BotsOwnRole" (protected)')
+  })
+
+  test('prune of an empty spec deletes channels → categories → roles', () => {
+    const diff = computeSpecDiff(currentSpec(), {}, pruneOpts)
+    expect(diff.entries.map(e => `${e.op}:${e.kind}:${e.name}`)).toEqual([
+      'delete:channel:mod-log',
+      'delete:channel:lobby',
+      'delete:category:Staff',
+      'delete:role:Mod',
+      'delete:role:Member',
+    ])
+  })
+
+  test('prune re-apply of an unchanged export is an empty diff (idempotent)', () => {
+    const diff = computeSpecDiff(currentSpec(), currentSpec(), pruneOpts)
+    expect(diff.entries).toEqual([])
+  })
+
+  test('prune:false still never deletes — unclaimed land in untouched (regression)', () => {
+    const diff = computeSpecDiff(currentSpec(), {}, { guildId: 'g1', managedRoleIds: ['r3'], botRoleIds: [] })
+    expect(diff.entries).toEqual([])
+    expect(diff.untouched).toContain('role "Member"')
+    expect(diff.untouched).toContain('channel "#lobby"')
+  })
+})
+
 describe('renderSpecDiff', () => {
   test('renders creates, modifies, flags, and the untouched list', () => {
     const current = buildServerSpec(fixtureState())
@@ -577,6 +730,40 @@ describe('renderSpecDiff', () => {
     const out = renderSpecDiff({ entries: [], untouched: [] })
     expect(out).toContain('0 change(s)')
     expect(out).toContain('already matches')
+  })
+
+  test('renders rename/move/DELETE lines with a per-class header breakdown', () => {
+    const current = buildServerSpec(fixtureState())
+    const diff = computeSpecDiff(current, {
+      roles: [{ id: 'r1', name: 'Moderator' }],
+      categories: [{ id: 'c1', name: 'Staff', channels: [{ id: 'c3', name: 'lobby' }] }],
+    }, { prune: true, guildId: 'g1', managedRoleIds: ['r3'], botRoleIds: [] })
+    const out = renderSpecDiff(diff)
+    expect(out).toContain('4 change(s) — ⚠ 2 DELETIONS · 2 renames/moves')
+    expect(out).toContain('~ rename role "Mod" → "Moderator"')
+    expect(out).toContain('~ move channel "#lobby": "(top-level)" → "Staff"')
+    expect(out).toContain('- DELETE channel "Staff / #mod-log"')
+    expect(out).toContain('- DELETE role "Member"')
+  })
+
+  test('deletions over the guard threshold add the LARGE PRUNE banner', () => {
+    const current = buildServerSpec(fixtureState())
+    // Full wipe: 5 deletions against 3 live channels — over the 50% bound.
+    const diff = computeSpecDiff(current, {}, { prune: true, guildId: 'g1', managedRoleIds: ['r3'], botRoleIds: [] })
+    expect(renderSpecDiff(diff)).toContain('⚠⚠ LARGE PRUNE: 5 deletions — review carefully')
+  })
+
+  test('a small prune has no banner', () => {
+    const current = buildServerSpec(fixtureState())
+    // Only lobby is unclaimed: 1 deletion, 3 live channels — under both bounds.
+    const diff = computeSpecDiff(current, {
+      everyone_permissions: ['SendMessages', 'ViewChannel'],
+      roles: [{ id: 'r1', name: 'Mod' }, { id: 'r2', name: 'Member' }],
+      categories: [{ id: 'c1', name: 'Staff', channels: [{ id: 'c2', name: 'mod-log' }] }],
+    }, { prune: true, guildId: 'g1', managedRoleIds: ['r3'], botRoleIds: [] })
+    const out = renderSpecDiff(diff)
+    expect(out).toContain('1 change(s) — ⚠ 1 DELETION')
+    expect(out).not.toContain('LARGE PRUNE')
   })
 })
 
