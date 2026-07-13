@@ -227,6 +227,10 @@ export type SpecOverwrite = {
 
 export type SpecRole = {
   name: string
+  /** The role's Discord snowflake, emitted by get_server_spec. Keep it when
+   *  editing a spec so a name change renames the live role instead of
+   *  creating a new one. A stale/foreign id falls back to name matching. */
+  id?: string
   /** Hex like '#5865f2' or a discord.js Colors name. Omitted = default (no color). */
   color?: string
   hoist?: boolean
@@ -239,6 +243,10 @@ export type SpecRole = {
 
 export type SpecChannel = {
   name: string
+  /** The channel's Discord snowflake, emitted by get_server_spec. Keep it so
+   *  a name change renames the live channel and a category change moves it,
+   *  instead of creating a duplicate. Stale/foreign ids fall back to name. */
+  id?: string
   /** text | voice | announcement | forum | stage. Defaults to text on create. */
   kind?: string
   topic?: string
@@ -250,6 +258,9 @@ export type SpecChannel = {
 
 export type SpecCategory = {
   name: string
+  /** The category's Discord snowflake, emitted by get_server_spec. Keep it so
+   *  a name change renames the live category (its channels follow along). */
+  id?: string
   overwrites?: SpecOverwrite[]
   channels?: SpecChannel[]
 }
@@ -347,9 +358,11 @@ function dangerousGrants(before: string[] | undefined, after: string[] | undefin
 // Serialize raw guild state into the spec shape. Deterministic: roles sorted
 // by position (highest first, like the Discord UI), channels by position,
 // permission arrays sorted. Managed roles (bot/integration roles) are
-// excluded — they can't be created or freely edited. Role-targeted overwrites
-// are emitted as '@everyone' / 'role:<Name>' (portable across guilds) when
-// the name is unambiguous, raw snowflakes otherwise.
+// excluded — they can't be created or freely edited. Every role/category/
+// channel carries its snowflake as `id` so an edited export can rename/move
+// entities in place (see computeSpecDiff's id matching). Role-targeted
+// overwrites are emitted as '@everyone' / 'role:<Name>' (portable across
+// guilds) when the name is unambiguous, raw snowflakes otherwise.
 export function buildServerSpec(state: RawGuildState): ServerSpec {
   const nameCounts = new Map<string, number>()
   for (const r of state.roles) nameCounts.set(r.name, (nameCounts.get(r.name) ?? 0) + 1)
@@ -372,7 +385,7 @@ export function buildServerSpec(state: RawGuildState): ServerSpec {
   }
 
   const specChannel = (c: RawChannel): SpecChannel => {
-    const ch: SpecChannel = { name: c.name, kind: channelTypeToKind(c.type)! }
+    const ch: SpecChannel = { name: c.name, id: c.id, kind: channelTypeToKind(c.type)! }
     if (c.topic) ch.topic = c.topic
     if (c.rateLimitPerUser) ch.slowmode = c.rateLimitPerUser
     if (c.nsfw) ch.nsfw = true
@@ -392,7 +405,7 @@ export function buildServerSpec(state: RawGuildState): ServerSpec {
     .filter(r => !r.managed)
     .sort((a, b) => b.position - a.position || a.id.localeCompare(b.id))
     .map(r => {
-      const role: SpecRole = { name: r.name }
+      const role: SpecRole = { name: r.name, id: r.id }
       if (r.hexColor && r.hexColor !== '#000000') role.color = r.hexColor
       if (r.hoist) role.hoist = true
       if (r.mentionable) role.mentionable = true
@@ -405,7 +418,7 @@ export function buildServerSpec(state: RawGuildState): ServerSpec {
     .filter(c => c.type === ChannelType.GuildCategory)
     .sort(byPosition)
     .map(cat => {
-      const out: SpecCategory = { name: cat.name }
+      const out: SpecCategory = { name: cat.name, id: cat.id }
       const ows = specOverwrites(cat.overwrites)
       if (ows) out.overwrites = ows
       out.channels = childrenOf(cat.id)
@@ -427,8 +440,11 @@ export type FieldChange = { field: string; before?: unknown; after: unknown }
 export type OverwriteEdit = { id: string; type?: 'role' | 'member'; set: Record<string, boolean | null> }
 export type SpecDiffEntry = {
   kind: 'everyone' | 'role' | 'category' | 'channel'
-  op: 'create' | 'modify'
+  op: 'create' | 'modify' | 'rename' | 'move' | 'delete'
   name: string
+  /** The live entity's snowflake — set on id-matched modify and on every
+   *  rename/move/delete so the applier resolves targets across renames. */
+  id?: string
   /** channels only: parent category name (null = top-level). */
   category?: string | null
   changes: FieldChange[]
@@ -437,7 +453,38 @@ export type SpecDiffEntry = {
   /** Human-readable ⚠ lines for dangerous grants. */
   dangerous: string[]
 }
-export type SpecDiff = { entries: SpecDiffEntry[]; untouched: string[] }
+export type SpecDiff = {
+  entries: SpecDiffEntry[]
+  untouched: string[]
+  /** Live channel + category count — feeds the large-prune banner. */
+  channelCount?: number
+}
+
+// Prune needs guild context the spec shape doesn't carry: which live roles
+// are managed, which the bot itself holds, and the guild id (identifies
+// @everyone). The never-delete filter consuming these is hard-coded inside
+// computeSpecDiff. NOTE: omitting managedRoleIds/botRoleIds REDUCES protection
+// (they're id backstops) — in practice server.ts always passes full context,
+// AND buildServerSpec pre-excludes managed/@everyone from `current`, so via the
+// live get_server_spec→apply path those roles are double-protected regardless.
+// id-less current entries are always unprunable (no id to target).
+export type SpecDiffOptions = {
+  /** Also emit delete entries for live entities the spec doesn't claim.
+   *  Default false — purely additive, exactly the pre-prune behavior. */
+  prune?: boolean
+  /** The guild's id — @everyone is the role whose id equals it. */
+  guildId?: string
+  /** Ids of managed (bot/integration/booster) roles. */
+  managedRoleIds?: string[]
+  /** Ids of roles the bot itself holds (its highest role). */
+  botRoleIds?: string[]
+}
+
+// Large-prune banner: a diff whose delete count exceeds EITHER bound gets a
+// ⚠⚠ line right under the header. Display-only — same single approval —
+// but impossible to miss when a partial spec is about to gut a guild.
+export const PRUNE_GUARD_MAX_DELETIONS = 5
+export const PRUNE_GUARD_CHANNEL_FRACTION = 0.5
 
 // The boolean map permissionOverwrites.edit takes, built to CONVERGE on the
 // desired overwrite: desired allow → true, desired deny → false, and any perm
@@ -513,15 +560,30 @@ export function specEntryLabel(e: SpecDiffEntry): string {
 }
 
 // Additive-upsert diff: `create` for spec entries missing from the guild,
-// `modify` (with before→after) where a spec-set field drifts. Fields the
-// spec leaves undefined are not compared; guild entities the spec doesn't
-// name land in `untouched` — NOTHING is ever deleted. Re-applying a spec
-// that already matches yields zero entries (idempotent). Throws (fail-fast,
-// nothing applied) on unknown permission names/colors/kinds, ambiguous
-// duplicate names, and channel-kind mismatches.
-export function computeSpecDiff(current: ServerSpec, desired: ServerSpec): SpecDiff {
+// `modify` (with before→after) where a spec-set field drifts. Matching is
+// two-tier: an entry carrying the `id` get_server_spec emits matches the
+// live entity with that snowflake — a differing name is then a `rename`, a
+// differing parent category a `move` (non-destructive updates, never
+// delete+create). Stale/foreign ids are hints, not requirements: they fall
+// back to name matching, then create. Fields the spec leaves undefined are
+// not compared; live entities no spec entry claims land in `untouched` —
+// unless opts.prune, which turns them into `delete` entries (ordered
+// channels → now-empty categories → roles). @everyone, managed roles, and
+// the bot's own roles can NEVER produce a delete entry, spec or no spec.
+// Re-applying a spec that already matches yields zero entries (idempotent).
+// Throws (fail-fast, nothing applied) on unknown permission names/colors/
+// kinds, ambiguous duplicate names, and channel-kind mismatches.
+export function computeSpecDiff(current: ServerSpec, desired: ServerSpec, opts: SpecDiffOptions = {}): SpecDiff {
   const entries: SpecDiffEntry[] = []
+  // Renames/moves apply after every create/update (so e.g. a move's target
+  // category exists); deletes go last, children before parents. Collected
+  // separately and concatenated in that order at the end.
+  const renames: SpecDiffEntry[] = []
+  const deletions: Record<'channel' | 'category' | 'role', SpecDiffEntry[]> = { channel: [], category: [], role: [] }
   const untouched: string[] = []
+  // Ids are hints — anything non-string (or empty) is treated as absent.
+  const specId = (id: unknown): string | undefined => (typeof id === 'string' && id.length > 0 ? id : undefined)
+  const isString = (x: string | undefined): x is string => x !== undefined
 
   // @everyone permissions — compared as a set only when the spec sets them.
   if (desired.everyone_permissions) {
@@ -542,26 +604,45 @@ export function computeSpecDiff(current: ServerSpec, desired: ServerSpec): SpecD
     untouched.push('@everyone permissions')
   }
 
-  // Roles — matched by name.
+  // Roles — id-matched first (enables rename), then by name. Live roles some
+  // spec id claims are off the name-match table, so an id-less entry can't
+  // grab a role that's being renamed out from under its old name.
   const desiredRoles = desired.roles ?? []
   const dupRole = findDup(desiredRoles.map(r => r.name))
   if (dupRole !== null) throw new Error(`spec.roles has duplicate name "${dupRole}"`)
+  const dupRoleId = findDup(desiredRoles.map(r => specId(r.id)).filter(isString))
+  if (dupRoleId !== null) throw new Error(`spec.roles has duplicate id "${dupRoleId}"`)
+  const currentRoles = current.roles ?? []
+  const currentRolesById = new Map(currentRoles.filter(r => specId(r.id)).map(r => [r.id!, r]))
+  const roleIdClaimed = new Set(desiredRoles.map(r => specId(r.id)).filter(isString).filter(id => currentRolesById.has(id)))
   const currentRolesByName = new Map<string, SpecRole[]>()
-  for (const r of current.roles ?? []) {
+  for (const r of currentRoles) {
+    if (specId(r.id) !== undefined && roleIdClaimed.has(r.id!)) continue
     currentRolesByName.set(r.name, [...(currentRolesByName.get(r.name) ?? []), r])
   }
-  const touchedRoles = new Set<string>()
+  const roleKey = (r: SpecRole) => specId(r.id) ?? `name:${r.name}`
+  const claimedRoles = new Set<string>()
   for (const want of desiredRoles) {
     if (!want.name || typeof want.name !== 'string') throw new Error('spec.roles: every role needs a name')
     if (want.name === '@everyone') throw new Error('set everyone_permissions for @everyone, not a roles[] entry')
     if (want.permissions) validatePermissionNames(want.permissions, `role "${want.name}" permissions`)
     if (want.color !== undefined) resolveColorInput(want.color) // validate before diffing
-    touchedRoles.add(want.name)
-    const have = currentRolesByName.get(want.name) ?? []
-    if (have.length > 1) {
-      throw new Error(`role name "${want.name}" is ambiguous — ${have.length} roles share it; rename one in Discord first`)
+    let cur = specId(want.id) !== undefined ? currentRolesById.get(want.id!) : undefined
+    if (cur) {
+      if (cur.name !== want.name) {
+        renames.push({
+          kind: 'role', op: 'rename', name: want.name, id: cur.id,
+          changes: [{ field: 'name', before: cur.name, after: want.name }], dangerous: [],
+        })
+      }
+    } else {
+      const have = currentRolesByName.get(want.name) ?? []
+      if (have.length > 1) {
+        throw new Error(`role name "${want.name}" is ambiguous — ${have.length} roles share it; rename one in Discord first`)
+      }
+      cur = have[0]
     }
-    if (have.length === 0) {
+    if (!cur) {
       const changes: FieldChange[] = []
       if (want.color !== undefined) changes.push({ field: 'color', after: want.color })
       if (want.hoist !== undefined) changes.push({ field: 'hoist', after: want.hoist })
@@ -573,7 +654,7 @@ export function computeSpecDiff(current: ServerSpec, desired: ServerSpec): SpecD
         dangerous: dangerousGrants(undefined, want.permissions).map(p => `grants ${p} to new role "${want.name}"`),
       })
     } else {
-      const cur = have[0]!
+      claimedRoles.add(roleKey(cur))
       const changes: FieldChange[] = []
       if (want.color !== undefined && resolveColorInput(want.color) !== resolveColorInput(cur.color ?? '#000000')) {
         changes.push({ field: 'color', before: cur.color ?? '#000000', after: want.color })
@@ -590,35 +671,71 @@ export function computeSpecDiff(current: ServerSpec, desired: ServerSpec): SpecD
       // position intentionally not diffed — create-only (see SpecRole).
       if (changes.length > 0) {
         entries.push({
-          kind: 'role', op: 'modify', name: want.name, changes,
+          kind: 'role', op: 'modify', name: want.name, id: cur.id, changes,
           dangerous: dangerousGrants(cur.permissions, want.permissions).map(p => `grants ${p} to role "${want.name}"`),
         })
       }
     }
   }
-  for (const r of current.roles ?? []) {
-    if (!touchedRoles.has(r.name)) untouched.push(`role "${r.name}"`)
+  for (const r of currentRoles) {
+    if (claimedRoles.has(roleKey(r))) continue
+    // NEVER-DELETE: @everyone (the role whose id === guild id), managed
+    // (bot/integration/booster) roles, and the bot's own roles survive prune
+    // no matter what the spec says. buildServerSpec already keeps managed
+    // roles out of specs, but a hand-built `current` could carry them — the
+    // filter here is the backstop, not the caller's discipline.
+    const rid = specId(r.id)
+    const deletable = rid !== undefined && rid !== opts.guildId &&
+      !(opts.managedRoleIds ?? []).includes(rid) && !(opts.botRoleIds ?? []).includes(rid)
+    if (opts.prune && deletable) {
+      deletions.role.push({ kind: 'role', op: 'delete', name: r.name, id: rid, changes: [], dangerous: [] })
+    } else {
+      untouched.push(`role "${r.name}"${opts.prune ? ' (protected)' : ''}`)
+    }
   }
 
-  // Categories — matched by name; only their own overwrites are diffed here
-  // (their channels go through the unified channel pass below).
+  // Categories — id-matched first, then by name; only their own overwrites
+  // are diffed here (their channels go through the unified channel pass
+  // below). Each desired category also resolves to an IDENTITY — the matched
+  // live category's key, or a create marker no live channel can sit under —
+  // which is what child channels key their location by. That keeps id-less
+  // children matched to their category through a rename (the name-based key
+  // would read a renamed parent as a brand-new location).
   const desiredCats = desired.categories ?? []
   const dupCat = findDup(desiredCats.map(c => c.name))
   if (dupCat !== null) throw new Error(`spec.categories has duplicate name "${dupCat}"`)
+  const dupCatId = findDup(desiredCats.map(c => specId(c.id)).filter(isString))
+  if (dupCatId !== null) throw new Error(`spec.categories has duplicate id "${dupCatId}"`)
   const currentCats = current.categories ?? []
+  const currentCatsById = new Map(currentCats.filter(c => specId(c.id)).map(c => [c.id!, c]))
+  const catIdClaimed = new Set(desiredCats.map(c => specId(c.id)).filter(isString).filter(id => currentCatsById.has(id)))
   const currentCatsByName = new Map<string, SpecCategory[]>()
   for (const c of currentCats) {
+    if (specId(c.id) !== undefined && catIdClaimed.has(c.id!)) continue
     currentCatsByName.set(c.name, [...(currentCatsByName.get(c.name) ?? []), c])
   }
-  const touchedCats = new Set<string>()
+  const catKey = (c: SpecCategory) => specId(c.id) ?? `name:${c.name}`
+  const claimedCats = new Set<string>()
+  const desiredCatIdentity = new Map<string, string>()
   for (const want of desiredCats) {
     if (!want.name || typeof want.name !== 'string') throw new Error('spec.categories: every category needs a name')
-    touchedCats.add(want.name)
-    const have = currentCatsByName.get(want.name) ?? []
-    if (have.length > 1) {
-      throw new Error(`category name "${want.name}" is ambiguous — ${have.length} categories share it; rename one in Discord first`)
+    let cur = specId(want.id) !== undefined ? currentCatsById.get(want.id!) : undefined
+    if (cur) {
+      if (cur.name !== want.name) {
+        renames.push({
+          kind: 'category', op: 'rename', name: want.name, id: cur.id,
+          changes: [{ field: 'name', before: cur.name, after: want.name }], dangerous: [],
+        })
+      }
+    } else {
+      const have = currentCatsByName.get(want.name) ?? []
+      if (have.length > 1) {
+        throw new Error(`category name "${want.name}" is ambiguous — ${have.length} categories share it; rename one in Discord first`)
+      }
+      cur = have[0]
     }
-    if (have.length === 0) {
+    desiredCatIdentity.set(want.name, cur ? catKey(cur) : `new:${want.name}`)
+    if (!cur) {
       const changes: FieldChange[] = []
       const dangerous: string[] = []
       if (want.overwrites) {
@@ -632,55 +749,86 @@ export function computeSpecDiff(current: ServerSpec, desired: ServerSpec): SpecD
       }
       entries.push({ kind: 'category', op: 'create', name: want.name, changes, dangerous })
     } else {
+      claimedCats.add(catKey(cur))
       const changes: FieldChange[] = []
       const edits: OverwriteEdit[] = []
       const dangerous: string[] = []
-      diffOverwrites(have[0]!.overwrites, want.overwrites, `category "${want.name}"`, changes, edits, dangerous)
+      diffOverwrites(cur.overwrites, want.overwrites, `category "${want.name}"`, changes, edits, dangerous)
       if (changes.length > 0) {
-        entries.push({ kind: 'category', op: 'modify', name: want.name, changes, overwriteEdits: edits, dangerous })
+        entries.push({ kind: 'category', op: 'modify', name: want.name, id: cur.id, changes, overwriteEdits: edits, dangerous })
       }
     }
   }
   for (const c of currentCats) {
-    if (!touchedCats.has(c.name)) untouched.push(`category "${c.name}"`)
+    if (claimedCats.has(catKey(c))) continue
+    const cid = specId(c.id)
+    if (opts.prune && cid !== undefined) {
+      deletions.category.push({ kind: 'category', op: 'delete', name: c.name, id: cid, changes: [], dangerous: [] })
+    } else {
+      untouched.push(`category "${c.name}"`)
+    }
   }
 
-  // Channels — matched by (category name, channel name). A channel "moved"
-  // to a different category in the spec reads as a create there; the
-  // original is left untouched (additive semantics — nothing moves or dies).
-  type Placed = { cat: string | null; ch: SpecChannel }
-  const chanKey = (cat: string | null, name: string) => `${cat ?? ''}\u0000${name}`
+  // Channels — id-matched first (enables rename AND move: an id-matched
+  // channel under a different parent identity is a `move`, not a create),
+  // then by (category identity, channel name). Without ids a channel "moved"
+  // to a different category in the spec still reads as a create there, with
+  // the original left untouched (additive semantics — nothing moves or dies).
+  type Placed = { cat: string | null; identity: string | null; ch: SpecChannel }
+  const chanKey = (identity: string | null, name: string) => `${identity ?? ''}\u0000${name}`
   const chanLabel = (cat: string | null, name: string) => `channel "${cat ? `${cat} / ` : ''}#${name}"`
   const desiredChans: Placed[] = [
-    ...desiredCats.flatMap(cat => (cat.channels ?? []).map(ch => ({ cat: cat.name as string | null, ch }))),
-    ...(desired.channels ?? []).map(ch => ({ cat: null, ch })),
+    ...desiredCats.flatMap(cat => (cat.channels ?? []).map(ch => ({ cat: cat.name as string | null, identity: desiredCatIdentity.get(cat.name) as string | null, ch }))),
+    ...(desired.channels ?? []).map(ch => ({ cat: null, identity: null as string | null, ch })),
   ]
-  const dupChan = findDup(desiredChans.map(p => chanKey(p.cat, p.ch.name)))
+  const dupChan = findDup(desiredChans.map(p => `${p.cat ?? ''}\u0000${p.ch.name}`))
   if (dupChan !== null) {
     const [cat, name] = dupChan.split('\u0000')
     throw new Error(`spec has duplicate ${chanLabel(cat || null, name!)}`)
   }
+  const dupChanId = findDup(desiredChans.map(p => specId(p.ch.id)).filter(isString))
+  if (dupChanId !== null) throw new Error(`spec has duplicate channel id "${dupChanId}"`)
   const currentChans: Placed[] = [
-    ...currentCats.flatMap(cat => (cat.channels ?? []).map(ch => ({ cat: cat.name as string | null, ch }))),
-    ...(current.channels ?? []).map(ch => ({ cat: null, ch })),
+    ...currentCats.flatMap(cat => (cat.channels ?? []).map(ch => ({ cat: cat.name as string | null, identity: catKey(cat) as string | null, ch }))),
+    ...(current.channels ?? []).map(ch => ({ cat: null, identity: null as string | null, ch })),
   ]
-  const currentChansByKey = new Map<string, SpecChannel[]>()
+  const currentChansById = new Map(currentChans.filter(p => specId(p.ch.id)).map(p => [p.ch.id!, p]))
+  const chanIdClaimed = new Set(desiredChans.map(p => specId(p.ch.id)).filter(isString).filter(id => currentChansById.has(id)))
+  const currentChansByKey = new Map<string, Placed[]>()
   for (const p of currentChans) {
-    const key = chanKey(p.cat, p.ch.name)
-    currentChansByKey.set(key, [...(currentChansByKey.get(key) ?? []), p.ch])
+    if (specId(p.ch.id) !== undefined && chanIdClaimed.has(p.ch.id!)) continue
+    const key = chanKey(p.identity, p.ch.name)
+    currentChansByKey.set(key, [...(currentChansByKey.get(key) ?? []), p])
   }
-  const touchedChans = new Set<string>()
-  for (const { cat, ch: want } of desiredChans) {
+  const chanClaimKey = (p: Placed) => specId(p.ch.id) ?? `name:${chanKey(p.identity, p.ch.name)}`
+  const claimedChans = new Set<string>()
+  for (const { cat, identity, ch: want } of desiredChans) {
     if (!want.name || typeof want.name !== 'string') throw new Error('spec channels: every channel needs a name')
     const kind = want.kind ?? 'text'
     kindToChannelType(kind) // validates the kind string
     const label = chanLabel(cat, want.name)
-    touchedChans.add(chanKey(cat, want.name))
-    const have = currentChansByKey.get(chanKey(cat, want.name)) ?? []
-    if (have.length > 1) {
-      throw new Error(`${label} is ambiguous — ${have.length} channels share that name in the same place; rename one in Discord first`)
+    let curPlaced = specId(want.id) !== undefined ? currentChansById.get(want.id!) : undefined
+    if (curPlaced) {
+      if (curPlaced.ch.name !== want.name) {
+        renames.push({
+          kind: 'channel', op: 'rename', name: want.name, id: curPlaced.ch.id, category: curPlaced.cat,
+          changes: [{ field: 'name', before: curPlaced.ch.name, after: want.name }], dangerous: [],
+        })
+      }
+      if (curPlaced.identity !== identity) {
+        renames.push({
+          kind: 'channel', op: 'move', name: want.name, id: curPlaced.ch.id, category: cat,
+          changes: [{ field: 'category', before: curPlaced.cat ?? '(top-level)', after: cat ?? '(top-level)' }], dangerous: [],
+        })
+      }
+    } else {
+      const have = currentChansByKey.get(chanKey(identity, want.name)) ?? []
+      if (have.length > 1) {
+        throw new Error(`${label} is ambiguous — ${have.length} channels share that name in the same place; rename one in Discord first`)
+      }
+      curPlaced = have[0]
     }
-    if (have.length === 0) {
+    if (!curPlaced) {
       const changes: FieldChange[] = [{ field: 'kind', after: kind }]
       const dangerous: string[] = []
       if (want.topic !== undefined) changes.push({ field: 'topic', after: want.topic })
@@ -697,7 +845,8 @@ export function computeSpecDiff(current: ServerSpec, desired: ServerSpec): SpecD
       }
       entries.push({ kind: 'channel', op: 'create', name: want.name, category: cat, changes, dangerous })
     } else {
-      const cur = have[0]!
+      claimedChans.add(chanClaimKey(curPlaced))
+      const cur = curPlaced.ch
       // Only enforce the type-match guard when the spec EXPLICITLY sets a kind.
       // A modify that omits kind targets the existing channel as-is (any type),
       // so editing e.g. a voice channel's topic without restating kind is fine.
@@ -718,15 +867,27 @@ export function computeSpecDiff(current: ServerSpec, desired: ServerSpec): SpecD
       }
       diffOverwrites(cur.overwrites, want.overwrites, label, changes, edits, dangerous)
       if (changes.length > 0) {
-        entries.push({ kind: 'channel', op: 'modify', name: want.name, category: cat, changes, overwriteEdits: edits, dangerous })
+        entries.push({ kind: 'channel', op: 'modify', name: want.name, id: cur.id, category: cat, changes, overwriteEdits: edits, dangerous })
       }
     }
   }
-  for (const { cat, ch } of currentChans) {
-    if (!touchedChans.has(chanKey(cat, ch.name))) untouched.push(chanLabel(cat, ch.name))
+  for (const p of currentChans) {
+    if (claimedChans.has(chanClaimKey(p))) continue
+    const cid = specId(p.ch.id)
+    if (opts.prune && cid !== undefined) {
+      deletions.channel.push({ kind: 'channel', op: 'delete', name: p.ch.name, id: cid, category: p.cat, changes: [], dangerous: [] })
+    } else {
+      untouched.push(chanLabel(p.cat, p.ch.name))
+    }
   }
 
-  return { entries, untouched }
+  return {
+    // Apply order: creates/updates, then renames/moves, then deletes —
+    // child channels before their (now-empty) categories, roles last.
+    entries: [...entries, ...renames, ...deletions.channel, ...deletions.category, ...deletions.role],
+    untouched,
+    channelCount: currentCats.length + currentChans.length,
+  }
 }
 
 function fmtVal(v: unknown): string {
@@ -736,13 +897,45 @@ function fmtVal(v: unknown): string {
 }
 
 // Human-readable diff for the owner-approval DM: `+ create`, `~ modify`
-// (before → after), inline ⚠ flags, then the `·` untouched list.
+// (before → after), `~ rename`/`~ move`, `- DELETE`, inline ⚠ flags, then
+// the `·` untouched list. A per-op-class breakdown joins the header when the
+// diff renames/moves/deletes (deletions first and loudest), and a diff whose
+// delete count exceeds the PRUNE_GUARD bounds gets a ⚠⚠ banner line.
 export function renderSpecDiff(diff: SpecDiff): string {
   const dangerCount = diff.entries.filter(e => e.dangerous.length > 0).length
-  const lines: string[] = [
-    `${diff.entries.length} change(s)${dangerCount > 0 ? ` — ⚠ ${dangerCount} with dangerous grants` : ''}`,
-  ]
+  const count = (op: SpecDiffEntry['op']) => diff.entries.filter(e => e.op === op).length
+  const dels = count('delete')
+  const renamesMoves = count('rename') + count('move')
+  let header = `${diff.entries.length} change(s)`
+  if (dels > 0 || renamesMoves > 0) {
+    const parts: string[] = []
+    if (dels > 0) parts.push(`⚠ ${dels} DELETION${dels === 1 ? '' : 'S'}`)
+    if (count('create') > 0) parts.push(`${count('create')} create${count('create') === 1 ? '' : 's'}`)
+    if (renamesMoves > 0) parts.push(`${renamesMoves} rename${renamesMoves === 1 ? '' : 's'}/move${renamesMoves === 1 ? '' : 's'}`)
+    if (count('modify') > 0) parts.push(`${count('modify')} update${count('modify') === 1 ? '' : 's'}`)
+    header += ` — ${parts.join(' · ')}`
+  }
+  if (dangerCount > 0) header += ` — ⚠ ${dangerCount} with dangerous grants`
+  const lines: string[] = [header]
+  if (dels > PRUNE_GUARD_MAX_DELETIONS ||
+      (diff.channelCount !== undefined && dels > diff.channelCount * PRUNE_GUARD_CHANNEL_FRACTION)) {
+    lines.push(`⚠⚠ LARGE PRUNE: ${dels} deletion${dels === 1 ? '' : 's'} — review carefully`)
+  }
   for (const e of diff.entries) {
+    if (e.op === 'delete') {
+      lines.push(`- DELETE ${specEntryLabel(e)}`)
+      continue
+    }
+    if (e.op === 'rename') {
+      const from = String(e.changes.find(c => c.field === 'name')?.before ?? '?')
+      lines.push(`~ rename ${specEntryLabel({ ...e, name: from })} → ${e.kind === 'channel' ? `#${e.name}` : `"${e.name}"`}`)
+      continue
+    }
+    if (e.op === 'move') {
+      const c = e.changes.find(x => x.field === 'category')
+      lines.push(`~ move channel "#${e.name}": ${fmtVal(c?.before)} → ${fmtVal(c?.after)}`)
+      continue
+    }
     const parts = e.changes.map(c =>
       c.before !== undefined ? `${c.field}: ${fmtVal(c.before)} → ${fmtVal(c.after)}` : `${c.field}: ${fmtVal(c.after)}`,
     )
