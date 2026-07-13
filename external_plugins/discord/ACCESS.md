@@ -58,6 +58,26 @@ With the default `requireMention: true`, the bot responds only when @mentioned o
 /discord:access group rm 846209781206941736
 ```
 
+## The /access slash command
+
+`/access` manages guild-channel access from inside Discord — no terminal
+needed. It is **owner-only**: the handler compares the invoking user against
+`DISCORD_OWNER_ID` (set it in `~/.claude/channels/discord/.env`) and refuses
+everyone else, including allowlisted users. With `DISCORD_OWNER_ID` unset the
+command refuses everyone (fail-closed). The command registers with
+`default_member_permissions: "0"`, so Discord also hides it from non-admins.
+
+| Usage | Effect |
+| --- | --- |
+| `/access action:list` | Show `dmPolicy` and every granted channel with its `requireMention` / `allowFrom`. |
+| `/access action:grant` | Grant the current channel (or `channel:` option). `mentions_only` sets `requireMention` (default `true`). Re-granting updates `requireMention` but **preserves** any existing `allowFrom` restriction. |
+| `/access action:remove` | Remove the channel's grant. |
+
+Replies are ephemeral. Writes go through the same lock + atomic-save path as
+the `/discord:access` skill. In static mode (`DISCORD_ACCESS_MODE=static`)
+`grant`/`remove` reply that access is read-only instead of silently no-oping;
+`list` still works (showing the boot snapshot).
+
 ## Mention detection
 
 In channels with `requireMention: true`, any of the following triggers the bot:
