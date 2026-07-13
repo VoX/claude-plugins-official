@@ -100,6 +100,8 @@ Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mo
 | `typing` | Show "bot is typing…" in a channel until a message is sent. Takes `chat_id`. The assistant calls this when it decides an inbound message needs a response, before doing the work. |
 | `fetch_messages` | Pull recent history from a channel (oldest-first). Capped at 100 per call. Each line includes the message ID so the model can `reply_to` it; messages with attachments are marked `+Natt`. Discord's search API isn't exposed to bots, so this is the only lookback. |
 | `download_attachment` | Download all attachments from a specific message by ID to `~/.claude/channels/discord/inbox/`. Optional `dest_dir` copies files to a target directory. Returns file paths + metadata. Use when `fetch_messages` shows a message has attachments. |
+| `get_server_spec` | Read a guild's structure as a spec object: `everyone_permissions`, roles (name/color/hoist/mentionable/permissions/position), categories with their channels (name/kind/topic/slowmode/nsfw/overwrites), plus a `bot` section (this bot's highest role position and which admin permissions it holds). Read-only; output is exactly what `apply_server_spec` consumes. |
+| `apply_server_spec` | Apply a server spec to a guild — additive upsert (create/update only, **never deletes**). Renders a diff and DMs it to `DISCORD_OWNER_ID` with Allow/Deny buttons; blocks until they decide (5-min timeout = deny). `dry_run: true` returns the diff without approval or changes. See [Server admin tools](#server-admin-tools). |
 
 The `typing` tool lets the assistant show a typing indicator manually —
 the bot does not auto-type on every inbound message (that made it look
@@ -143,7 +145,58 @@ than the OS prompt layer. Default off. Every auto-allow writes
 `permission_request <id> auto-allowed (DISCORD_AUTO_ALLOW_PERMISSIONS=1)
 tool=<name>` to stderr for audit.
 
+## Server admin tools
+
+`get_server_spec` and `apply_server_spec` let the assistant read and shape a
+guild's structure declaratively. There is no env gate and no guild scoping —
+the tools are always present and work on any guild the bot is in; **approval
+is the gate**.
+
+**The spec.** A JSON object: `everyone_permissions` (permission-name array for
+the `@everyone` role), `roles[]`, `categories[]` (each with `overwrites[]` and
+`channels[]`), and top-level `channels[]` for channels outside any category.
+Channel `kind` is `text` / `voice` / `announcement` / `forum` / `stage`.
+Overwrite targets are `"@everyone"`, `"role:<Name>"`, or a raw snowflake with
+`type: "role" | "member"`. Permission names are discord.js `PermissionFlagsBits`
+keys (`ViewChannel`, `ManageMessages`, …); colors are hex or discord.js color
+names. Role `position` applies on create only — existing roles are never
+reordered.
+
+**Additive semantics.** `apply_server_spec` diffs the spec against the live
+guild and upserts: missing things are created, drifted spec-set fields are
+updated, and anything the spec doesn't mention is *left untouched* — the tool
+never deletes or moves existing roles/channels. Fields omitted from a spec
+entry aren't compared. Re-applying a matching spec yields an empty diff.
+
+**Owner approval.** Every mutating apply DMs the rendered diff (as a text
+attachment) to the user in `DISCORD_OWNER_ID` with Allow / Deny buttons and
+blocks the tool call until they answer; no answer within 5 minutes counts as
+deny. Dangerous grants — Administrator, ManageGuild, ManageRoles,
+ManageChannels, ManageWebhooks, KickMembers, BanMembers, MentionEveryone —
+are flagged with ⚠ in the DM. `dry_run: true` skips approval and returns the
+diff without changing anything. If `DISCORD_OWNER_ID` is unset the tool
+refuses to mutate (fail-closed).
+
+Set the owner's user snowflake in `~/.claude/channels/discord/.env`:
+
+```
+DISCORD_OWNER_ID=184695080709324800
+```
+
+While the call waits on the buttons it emits MCP progress notifications
+(every 25 s) so the client's per-tool-call timeout doesn't kill it — this
+requires the MCP client to send a `progressToken` with the call (Claude Code
+does). If your client doesn't, raise `MCP_TOOL_TIMEOUT` above 5 minutes.
+
+**`/access` slash command.** An owner-only Discord command mirroring the
+grant/remove parts of the `/discord:access` skill — see
+[ACCESS.md](./ACCESS.md#the-access-slash-command).
+
 ## Changelog
+
+### 0.3.0
+- New `get_server_spec` / `apply_server_spec` tools: read a guild's structure as a declarative spec; apply one additively with an owner-approved diff (Allow/Deny DM buttons, dangerous-grant ⚠ flags, `dry_run` preview). New `DISCORD_OWNER_ID` env var (fail-closed for mutations).
+- New owner-only `/access` slash command: `grant` / `remove` / `list` guild-channel access from inside Discord (merge-preserves `allowFrom`, read-only reply in static mode).
 
 ### 0.2.18
 - Harden gateway lifecycle: exit on `shardDisconnect` / `invalidated` / terminal `error`, log-only for `shardError`, plus a 30s-interval watchdog that exits after 3 consecutive non-READY `client.ws.status` checks (resets on inbound messages) so systemd restarts a silently dead socket.

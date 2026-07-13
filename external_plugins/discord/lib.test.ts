@@ -1,5 +1,10 @@
 import { test, expect, describe } from 'bun:test'
-import { safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, composePresence } from './lib'
+import {
+  safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, composePresence,
+  resolveColorInput, validatePermissionNames, kindToChannelType, channelTypeToKind,
+  buildServerSpec, computeSpecDiff, renderSpecDiff, overwriteEditMap, grantGroup, removeGroup,
+  type RawGuildState, type ServerSpec,
+} from './lib'
 
 describe('safeSlice', () => {
   test('returns input unchanged when shorter than limit', () => {
@@ -269,5 +274,345 @@ describe('composePresence', () => {
   test('a "run <name>" label whose name is idle/working is NOT a sentinel (emoji-matched)', () => {
     expect(composePresence('🐾 working…\n⚙️ run idle…\n')).toBe('⚙️ run idle…')
     expect(composePresence('🐾 working…\n⚙️ run working…\n')).toBe('⚙️ run working…')
+  })
+})
+
+describe('resolveColorInput', () => {
+  test('resolves hex with and without hash', () => {
+    expect(resolveColorInput('#5865f2')).toBe(0x5865f2)
+    expect(resolveColorInput('5865f2')).toBe(0x5865f2)
+  })
+
+  test('resolves named colors case-insensitively', () => {
+    expect(resolveColorInput('blurple')).toBe(resolveColorInput('Blurple'))
+    expect(resolveColorInput('BLURPLE')).toBe(resolveColorInput('Blurple'))
+  })
+
+  test('throws on garbage', () => {
+    expect(() => resolveColorInput('not-a-color')).toThrow(/invalid color/)
+  })
+})
+
+describe('validatePermissionNames', () => {
+  test('valid names pass through', () => {
+    expect(validatePermissionNames(['ViewChannel', 'SendMessages', 'BanMembers'], 'test'))
+      .toEqual(['ViewChannel', 'SendMessages', 'BanMembers'])
+  })
+
+  test('unknown name throws with the name and context in the message', () => {
+    expect(() => validatePermissionNames(['ViewChannel', 'NotAPerm'], 'role "Mod"'))
+      .toThrow(/role "Mod".*NotAPerm/)
+  })
+
+  test('prototype-chain keys are rejected (Object.hasOwn, not `in`)', () => {
+    expect(() => validatePermissionNames(['constructor'], 'test')).toThrow(/unknown permission/)
+  })
+})
+
+describe('channel kind mapping', () => {
+  test('round-trips every supported kind', () => {
+    for (const kind of ['text', 'voice', 'announcement', 'forum', 'stage']) {
+      expect(channelTypeToKind(kindToChannelType(kind))).toBe(kind)
+    }
+  })
+
+  test('unknown kind throws', () => {
+    expect(() => kindToChannelType('carrier-pigeon')).toThrow(/unknown channel kind/)
+  })
+
+  test('unsupported channel types map to null', () => {
+    expect(channelTypeToKind(4)).toBe(null)   // GuildCategory — not a leaf kind
+    expect(channelTypeToKind(14)).toBe(null)  // GuildDirectory
+  })
+})
+
+// Shared fixture: a small guild with one category, two channels, a couple of
+// roles (one managed), and overwrites on the category + text channel.
+function fixtureState(): RawGuildState {
+  return {
+    guildId: 'g1',
+    everyonePermissions: ['ViewChannel', 'SendMessages'],
+    roles: [
+      { id: 'r1', name: 'Mod', hexColor: '#5865f2', hoist: true, mentionable: false, permissions: ['KickMembers', 'ViewChannel'], position: 2, managed: false },
+      { id: 'r2', name: 'Member', hexColor: '#000000', hoist: false, mentionable: true, permissions: ['ViewChannel'], position: 1, managed: false },
+      { id: 'r3', name: 'SomeBot', hexColor: '#000000', hoist: false, mentionable: false, permissions: ['Administrator'], position: 3, managed: true },
+    ],
+    channels: [
+      { id: 'c1', name: 'Staff', type: 4, parentId: null, position: 0, topic: null, rateLimitPerUser: null, nsfw: false,
+        overwrites: [{ id: 'g1', type: 'role', allow: [], deny: ['ViewChannel'] }] },
+      { id: 'c2', name: 'mod-log', type: 0, parentId: 'c1', position: 0, topic: 'mod actions', rateLimitPerUser: 30, nsfw: false,
+        overwrites: [{ id: 'r1', type: 'role', allow: ['ViewChannel'], deny: [] }, { id: 'u9', type: 'member', allow: [], deny: [] }] },
+      { id: 'c3', name: 'lobby', type: 0, parentId: null, position: 1, topic: null, rateLimitPerUser: 0, nsfw: false, overwrites: [] },
+    ],
+  }
+}
+
+describe('buildServerSpec', () => {
+  const spec = buildServerSpec(fixtureState())
+
+  test('serializes @everyone permissions sorted', () => {
+    expect(spec.everyone_permissions).toEqual(['SendMessages', 'ViewChannel'])
+  })
+
+  test('excludes managed roles, sorts by position (highest first)', () => {
+    expect(spec.roles!.map(r => r.name)).toEqual(['Mod', 'Member'])
+  })
+
+  test('serializes role fields, omitting defaults', () => {
+    const mod = spec.roles![0]!
+    expect(mod).toEqual({ name: 'Mod', color: '#5865f2', hoist: true, permissions: ['KickMembers', 'ViewChannel'], position: 2 })
+    const member = spec.roles![1]!
+    expect(member.color).toBeUndefined()   // #000000 = no color
+    expect(member.hoist).toBeUndefined()
+    expect(member.mentionable).toBe(true)
+  })
+
+  test('nests channels under their category, keeps top-level channels separate', () => {
+    expect(spec.categories!.map(c => c.name)).toEqual(['Staff'])
+    expect(spec.categories![0]!.channels!.map(c => c.name)).toEqual(['mod-log'])
+    expect(spec.channels!.map(c => c.name)).toEqual(['lobby'])
+  })
+
+  test('maps overwrite targets to @everyone / role:<Name>, keeps member snowflakes', () => {
+    expect(spec.categories![0]!.overwrites).toEqual([{ id: '@everyone', type: 'role', deny: ['ViewChannel'] }])
+    const modLog = spec.categories![0]!.channels![0]!
+    expect(modLog.overwrites).toEqual([{ id: 'role:Mod', type: 'role', allow: ['ViewChannel'] }])
+  })
+
+  test('drops empty overwrites and empty overwrite lists', () => {
+    // u9's all-empty overwrite vanished above; lobby has none at all
+    expect(spec.channels![0]!.overwrites).toBeUndefined()
+  })
+
+  test('keeps raw snowflake for ambiguous duplicate role names', () => {
+    const state = fixtureState()
+    state.roles.push({ id: 'r4', name: 'Mod', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 0, managed: false })
+    const s = buildServerSpec(state)
+    const modLog = s.categories![0]!.channels![0]!
+    expect(modLog.overwrites![0]!.id).toBe('r1')
+  })
+
+  test('serializes channel topic/slowmode, omits zero-values', () => {
+    const modLog = spec.categories![0]!.channels![0]!
+    expect(modLog.topic).toBe('mod actions')
+    expect(modLog.slowmode).toBe(30)
+    expect(spec.channels![0]!.slowmode).toBeUndefined()
+  })
+})
+
+describe('computeSpecDiff', () => {
+  const currentSpec = () => buildServerSpec(fixtureState())
+
+  test('re-applying the serialized spec yields an empty diff (idempotent)', () => {
+    const diff = computeSpecDiff(currentSpec(), currentSpec())
+    expect(diff.entries).toEqual([])
+  })
+
+  test('empty spec changes nothing, lists everything untouched', () => {
+    const diff = computeSpecDiff(currentSpec(), {})
+    expect(diff.entries).toEqual([])
+    expect(diff.untouched).toContain('role "Mod"')
+    expect(diff.untouched).toContain('category "Staff"')
+    expect(diff.untouched).toContain('channel "Staff / #mod-log"')
+    expect(diff.untouched).toContain('channel "#lobby"')
+    expect(diff.untouched).toContain('@everyone permissions')
+  })
+
+  test('detects role create with dangerous-perm flag', () => {
+    const diff = computeSpecDiff(currentSpec(), {
+      roles: [{ name: 'Admin', permissions: ['Administrator'], color: '#ff0000' }],
+    })
+    expect(diff.entries).toHaveLength(1)
+    const e = diff.entries[0]!
+    expect(e).toMatchObject({ kind: 'role', op: 'create', name: 'Admin' })
+    expect(e.dangerous).toEqual(['grants Administrator to new role "Admin"'])
+  })
+
+  test('detects role modify with before→after, only for drifted fields', () => {
+    const diff = computeSpecDiff(currentSpec(), {
+      roles: [{ name: 'Mod', hoist: false, permissions: ['KickMembers', 'ViewChannel', 'BanMembers'] }],
+    })
+    expect(diff.entries).toHaveLength(1)
+    const e = diff.entries[0]!
+    expect(e.op).toBe('modify')
+    expect(e.changes).toEqual([
+      { field: 'hoist', before: true, after: false },
+      { field: 'permissions', before: ['KickMembers', 'ViewChannel'], after: ['BanMembers', 'KickMembers', 'ViewChannel'] },
+    ])
+    expect(e.dangerous).toEqual(['grants BanMembers to role "Mod"'])
+  })
+
+  test('matching role fields produce no entry (additive, field-level)', () => {
+    // Only name + one already-matching field: nothing to do.
+    const diff = computeSpecDiff(currentSpec(), { roles: [{ name: 'Mod', hoist: true }] })
+    expect(diff.entries).toEqual([])
+  })
+
+  test('revoking a dangerous perm is a change but NOT flagged dangerous', () => {
+    const diff = computeSpecDiff(currentSpec(), { roles: [{ name: 'Mod', permissions: ['ViewChannel'] }] })
+    expect(diff.entries).toHaveLength(1)
+    expect(diff.entries[0]!.dangerous).toEqual([])
+  })
+
+  test('detects @everyone permission change with dangerous flag', () => {
+    const diff = computeSpecDiff(currentSpec(), { everyone_permissions: ['ViewChannel', 'SendMessages', 'MentionEveryone'] })
+    expect(diff.entries).toHaveLength(1)
+    expect(diff.entries[0]!.kind).toBe('everyone')
+    expect(diff.entries[0]!.dangerous).toEqual(['grants MentionEveryone to @everyone'])
+  })
+
+  test('detects category + channel creates, in dependency order', () => {
+    const diff = computeSpecDiff(currentSpec(), {
+      categories: [{ name: 'Voice Zone', channels: [{ name: 'hangout', kind: 'voice' }] }],
+    })
+    expect(diff.entries.map(e => `${e.kind}:${e.op}`)).toEqual(['category:create', 'channel:create'])
+    expect(diff.entries[1]!).toMatchObject({ name: 'hangout', category: 'Voice Zone' })
+  })
+
+  test('detects channel field drift (topic/slowmode/nsfw)', () => {
+    const diff = computeSpecDiff(currentSpec(), {
+      categories: [{ name: 'Staff', channels: [{ name: 'mod-log', topic: 'new topic', slowmode: 0, nsfw: true }] }],
+    })
+    expect(diff.entries).toHaveLength(1)
+    expect(diff.entries[0]!.changes).toEqual([
+      { field: 'topic', before: 'mod actions', after: 'new topic' },
+      { field: 'slowmode', before: 30, after: 0 },
+      { field: 'nsfw', before: false, after: true },
+    ])
+  })
+
+  test('detects overwrite drift and emits a converging edit map', () => {
+    const diff = computeSpecDiff(currentSpec(), {
+      categories: [{ name: 'Staff', channels: [{ name: 'mod-log', overwrites: [{ id: 'role:Mod', allow: ['ViewChannel', 'ManageMessages'] }] }] }],
+    })
+    expect(diff.entries).toHaveLength(1)
+    const e = diff.entries[0]!
+    expect(e.overwriteEdits).toEqual([
+      { id: 'role:Mod', type: undefined, set: { ViewChannel: true, ManageMessages: true } },
+    ])
+  })
+
+  test('overwrite edit map nulls out perms the spec no longer sets', () => {
+    expect(overwriteEditMap({ allow: ['ViewChannel', 'ManageMessages'], deny: ['SendMessages'] }, { allow: ['ViewChannel'] }))
+      .toEqual({ ViewChannel: true, ManageMessages: null, SendMessages: null })
+  })
+
+  test('new dangerous overwrite grant is flagged', () => {
+    const diff = computeSpecDiff(currentSpec(), {
+      channels: [{ name: 'lobby', overwrites: [{ id: 'role:Mod', allow: ['MentionEveryone'] }] }],
+    })
+    expect(diff.entries[0]!.dangerous).toEqual(['grants MentionEveryone via overwrite role:Mod on channel "#lobby"'])
+  })
+
+  test('never deletes: extra current entities land in untouched, not entries', () => {
+    const diff = computeSpecDiff(currentSpec(), { roles: [{ name: 'Mod', hoist: true }] })
+    expect(diff.entries).toEqual([])
+    expect(diff.untouched).toContain('role "Member"')
+  })
+
+  test('throws on unknown permission name', () => {
+    expect(() => computeSpecDiff(currentSpec(), { roles: [{ name: 'X', permissions: ['Yeet'] }] }))
+      .toThrow(/unknown permission name/)
+  })
+
+  test('throws on unknown channel kind', () => {
+    expect(() => computeSpecDiff(currentSpec(), { channels: [{ name: 'x', kind: 'podcast' }] }))
+      .toThrow(/unknown channel kind/)
+  })
+
+  test('throws on channel kind mismatch with the existing channel', () => {
+    expect(() => computeSpecDiff(currentSpec(), { channels: [{ name: 'lobby', kind: 'voice' }] }))
+      .toThrow(/exists as text but the spec says voice/)
+  })
+
+  test('throws on @everyone in roles[]', () => {
+    expect(() => computeSpecDiff(currentSpec(), { roles: [{ name: '@everyone' }] }))
+      .toThrow(/everyone_permissions/)
+  })
+
+  test('throws on duplicate role names in the spec', () => {
+    expect(() => computeSpecDiff(currentSpec(), { roles: [{ name: 'X' }, { name: 'X' }] }))
+      .toThrow(/duplicate name "X"/)
+  })
+
+  test('throws when targeting an ambiguous duplicate role name in the guild', () => {
+    const state = fixtureState()
+    state.roles.push({ id: 'r4', name: 'Mod', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 0, managed: false })
+    expect(() => computeSpecDiff(buildServerSpec(state), { roles: [{ name: 'Mod', hoist: false }] }))
+      .toThrow(/ambiguous/)
+  })
+
+  test('throws on raw-snowflake overwrite without a type', () => {
+    expect(() => computeSpecDiff(currentSpec(), { channels: [{ name: 'lobby', overwrites: [{ id: '12345', allow: ['ViewChannel'] }] }] }))
+      .toThrow(/set type/)
+  })
+
+  test('color compared by resolved value, not string form', () => {
+    // #5865f2 both ways — one uppercase, no hash: still equal, no entry.
+    const diff = computeSpecDiff(currentSpec(), { roles: [{ name: 'Mod', color: '5865F2' }] })
+    expect(diff.entries).toEqual([])
+  })
+})
+
+describe('renderSpecDiff', () => {
+  test('renders creates, modifies, flags, and the untouched list', () => {
+    const current = buildServerSpec(fixtureState())
+    const desired: ServerSpec = {
+      roles: [
+        { name: 'Admin', permissions: ['Administrator'] },
+        { name: 'Mod', hoist: false },
+      ],
+    }
+    const out = renderSpecDiff(computeSpecDiff(current, desired))
+    expect(out).toContain('2 change(s)')
+    expect(out).toContain('⚠ 1 with dangerous grants')
+    expect(out).toContain('+ role "Admin" — permissions: [Administrator]')
+    expect(out).toContain('~ role "Mod" — hoist: true → false')
+    expect(out).toContain('⚠ grants Administrator to new role "Admin"')
+    expect(out).toContain('· left untouched (not in spec):')
+    expect(out).toContain('role "Member"')
+  })
+
+  test('empty diff renders the already-matching note', () => {
+    const out = renderSpecDiff({ entries: [], untouched: [] })
+    expect(out).toContain('0 change(s)')
+    expect(out).toContain('already matches')
+  })
+})
+
+describe('grantGroup / removeGroup', () => {
+  test('grant creates a fresh entry with empty allowFrom', () => {
+    const groups: Record<string, { requireMention: boolean; allowFrom: string[] }> = {}
+    grantGroup(groups, '123', true)
+    expect(groups['123']).toEqual({ requireMention: true, allowFrom: [] })
+  })
+
+  test('re-grant preserves existing allowFrom (merge, not clobber)', () => {
+    const groups = { '123': { requireMention: true, allowFrom: ['42', '43'] } }
+    grantGroup(groups, '123', false)
+    expect(groups['123']).toEqual({ requireMention: false, allowFrom: ['42', '43'] })
+  })
+
+  test('grant is idempotent', () => {
+    const groups = { '123': { requireMention: true, allowFrom: ['42'] } }
+    grantGroup(groups, '123', true)
+    grantGroup(groups, '123', true)
+    expect(groups).toEqual({ '123': { requireMention: true, allowFrom: ['42'] } })
+  })
+
+  test('grant leaves other channels alone', () => {
+    const groups = { '999': { requireMention: false, allowFrom: [] } }
+    grantGroup(groups, '123', true)
+    expect(groups['999']).toEqual({ requireMention: false, allowFrom: [] })
+  })
+
+  test('remove deletes the entry and reports true', () => {
+    const groups = { '123': { requireMention: true, allowFrom: [] } }
+    expect(removeGroup(groups, '123')).toBe(true)
+    expect('123' in groups).toBe(false)
+  })
+
+  test('remove of an unknown channel reports false', () => {
+    expect(removeGroup({}, '123')).toBe(false)
   })
 })
