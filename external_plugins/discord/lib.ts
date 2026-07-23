@@ -180,6 +180,12 @@ export const PRESENCE_IDLE = '💤 idle…'
 export const isIdle = (t: string) => t.includes('💤')
 export const isWorking = (t: string) => t.includes('🐾')
 
+// Prefix the live context-window size (the number Claude Code's /status shows, e.g. "565k") in front of
+// a presence status → "565k - 💤 idle…". Empty ctx (unknown / not computed yet) or empty text (clearing
+// presence) leaves the text unchanged, so a clear stays a clear and turn-1 shows no stray prefix.
+export const withContextPrefix = (ctx: string, text: string): string =>
+  ctx && text ? `${ctx} - ${text}` : text
+
 // Compose the aggregate from the per-turn sequence file: the DISTINCT actions that fired
 // this turn, in first-occurrence order, space-joined with one trailing ellipsis. "working"
 // is dropped unless it's the only thing that fired; '' for empty/absent. Parse/compose happens

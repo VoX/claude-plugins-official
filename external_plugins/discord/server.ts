@@ -54,7 +54,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir, tmpdir } from 'os'
 import { join, sep, dirname } from 'path'
 import sharp from 'sharp'
-import { safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, isWorking, composePresence, buildServerSpec, computeSpecDiff, renderSpecDiff, specEntryLabel, kindToChannelType, resolveColorInput, grantGroup, removeGroup, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type RawGuildState, type SpecDiff, type SpecOverwrite, type OverwriteEdit } from './lib'
+import { safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, isWorking, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, specEntryLabel, kindToChannelType, resolveColorInput, grantGroup, removeGroup, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type RawGuildState, type SpecDiff, type SpecOverwrite, type OverwriteEdit } from './lib'
 
 // Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
 // environment (only our systemd service sets it). Fresh claude CLI sessions
@@ -819,6 +819,10 @@ function stopAllTyping(): void {
 // Typing is started in handleInbound (real Discord inbound only) and stopped here
 // when the file clears — so non-Discord turns (cron/CLI) never trigger typing.
 const PRESENCE_FILE = join(STATE_DIR, '.presence-activity')
+// The live context-window size prefix (e.g. "565k"), written by the presence hooks (context-size.sh)
+// from the session transcript; prepended to every status so the presence reads "565k - 💤 idle…".
+const PRESENCE_CONTEXT_FILE = join(STATE_DIR, '.presence-context')
+const readContextPrefix = (): string => { try { return readFileSync(PRESENCE_CONTEXT_FILE, 'utf8').trim() } catch { return '' } }
 const PRESENCE_ACTIVITY = process.env.DISCORD_PRESENCE_ACTIVITY === '1'
 const PRESENCE_TYPING = process.env.DISCORD_PRESENCE_TYPING === '1'
 const PRESENCE_POLL_MS = 250             // detect new events fast (publish cadence governed by the limiter below)
@@ -845,7 +849,9 @@ const isResting = (t: string) => t === '' || isIdle(t)
 // The actual presence write (dot + activity text) + typing-stop. Deduped. Returns true iff an
 // actual wire write happened (so the caller only consumes a rate-limit slot on a real publish).
 function setPresenceNow(text: string): boolean {
-  text = sanitizeStatus(text)
+  // prefix the live context-window size ("565k - …") BEFORE sanitize, so the 128-cap counts the prefix
+  // too; a clear ('') stays '' (withContextPrefix leaves empty text alone).
+  text = sanitizeStatus(withContextPrefix(readContextPrefix(), text))
   if (text === lastPresenceText) return false  // dedupe: no wire write
   lastPresenceText = text
   const resting = isResting(text)
@@ -2517,6 +2523,17 @@ async function buildUsageReply(): Promise<string> {
     const pct = Math.round(Number(b.utilization ?? 0))
     const resets = usageResetIn(b.resets_at)
     lines.push(`• ${label}: ${pct}%${resets ? ` · resets in ${resets}` : ''}`)
+  }
+  // Fable is a per-MODEL SCOPED weekly limit — it has no top-level bucket; it rides data.limits[] with
+  // scope.model.display_name == "Fable" (and .percent, not .utilization). Surface it alongside the buckets.
+  const fable = Array.isArray(data?.limits)
+    ? data.limits.find((l: any) => l?.scope?.model?.display_name === 'Fable')
+    : null
+  if (fable) {
+    any = true
+    const pct = Math.round(Number(fable.percent ?? 0))
+    const resets = usageResetIn(fable.resets_at)
+    lines.push(`• 7d fable: ${pct}%${resets ? ` · resets in ${resets}` : ''}`)
   }
   if (!any) lines.push('• (no usage windows returned)')
 

@@ -11,7 +11,15 @@ set -u
 [ "${DISCORD_PRESENCE_ACTIVITY:-}" = "1" ] || [ "${DISCORD_PRESENCE_TYPING:-}" = "1" ] || exit 0
 here="$(cd "$(dirname "$0")" && pwd)"
 cmd=""
-if command -v jq >/dev/null 2>&1; then cmd="$(jq -r '.tool_input.command // ""' 2>/dev/null)"; fi
+# read the hook JSON ONCE (we need both the command AND the transcript_path from it; we exec
+# presence-status.sh below, which would find stdin already drained). Refresh the context-size prefix
+# here since we own the stdin for the Bash matcher.
+if command -v jq >/dev/null 2>&1; then
+  hook_json="$([ -t 0 ] || cat 2>/dev/null)"
+  cmd="$(printf '%s' "$hook_json" | jq -r '.tool_input.command // ""' 2>/dev/null)"
+  tp="$(printf '%s' "$hook_json" | jq -r '.transcript_path // ""' 2>/dev/null)"
+  [ -n "$tp" ] && bash "$here/context-size.sh" "$tp"
+fi
 
 # Resolve the RIGHTMOST meaningful chain segment to (command, first-arg). Split on joiners
 # (&&/||/;/|/&); within a segment skip `VAR=value` assignments + wrapper prefixes (env/sudo/…)

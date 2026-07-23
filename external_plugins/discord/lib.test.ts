@@ -1,6 +1,6 @@
 import { test, expect, describe } from 'bun:test'
 import {
-  safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, composePresence,
+  safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, composePresence, withContextPrefix,
   resolveColorInput, validatePermissionNames, kindToChannelType, channelTypeToKind,
   buildServerSpec, computeSpecDiff, renderSpecDiff, overwriteEditMap, grantGroup, removeGroup,
   type RawGuildState, type ServerSpec,
@@ -228,6 +228,20 @@ describe('chunk', () => {
     const out = chunk('hello world', 5)
     expect(out[1]).toBe('world')
     expect(out[1].startsWith(' ')).toBe(false)
+  })
+})
+
+describe('withContextPrefix', () => {
+  test('prefixes the context size onto a status', () => {
+    expect(withContextPrefix('565k', '💤 idle…')).toBe('565k - 💤 idle…')
+    expect(withContextPrefix('242k', '🐾 working…')).toBe('242k - 🐾 working…')
+  })
+  test('empty context leaves the status unchanged (unknown / turn 1)', () => {
+    expect(withContextPrefix('', '💤 idle…')).toBe('💤 idle…')
+  })
+  test('empty status stays empty (a clear stays a clear, no stray prefix)', () => {
+    expect(withContextPrefix('565k', '')).toBe('')
+    expect(withContextPrefix('', '')).toBe('')
   })
 })
 
