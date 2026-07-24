@@ -54,7 +54,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir, tmpdir } from 'os'
 import { join, sep, dirname } from 'path'
 import sharp from 'sharp'
-import { safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, isWorking, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, specEntryLabel, kindToChannelType, resolveColorInput, grantGroup, removeGroup, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type RawGuildState, type SpecDiff, type SpecOverwrite, type OverwriteEdit } from './lib'
+import { safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, isWorking, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, specEntryLabel, kindToChannelType, resolveColorInput, grantGroup, removeGroup, makeTtlCache, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type RawGuildState, type SpecDiff, type SpecOverwrite, type OverwriteEdit } from './lib'
 
 // Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
 // environment (only our systemd service sets it). Fresh claude CLI sessions
@@ -2473,11 +2473,25 @@ function usageResetIn(iso: unknown): string {
 // Mirrors summarizeViaHaiku's credential handling (CRED_FILE -> claudeAiOauth +
 // Bearer token + anthropic-beta). Self-contained so every bot sharing this
 // plugin reports its own account; returns a friendly string on any failure.
+// 60s TTL on the API RESPONSE (not the rendered text), with concurrent callers sharing one
+// in-flight request. /usage is open to every user now, so without this a busy channel would
+// hammer the upstream endpoint — and the numbers barely move second to second anyway.
+const USAGE_CACHE_TTL_MS = 60_000
+const usageCache = makeTtlCache<{ ok: true; data: Record<string, any> } | { ok: false; message: string }>(USAGE_CACHE_TTL_MS)
+
 async function buildUsageReply(): Promise<string> {
+  const fetched = await usageCache.get(fetchUsage)
+  if (!fetched.ok) return fetched.message
+  return renderUsage(fetched.data)
+}
+
+// The network half — everything cached. Returns a discriminated result rather than throwing so a
+// friendly failure string is cached-or-not on exactly the same path as a success.
+async function fetchUsage(): Promise<{ ok: true; data: Record<string, any> } | { ok: false; message: string }> {
   let cred
-  try { cred = JSON.parse(readFileSync(CRED_FILE, 'utf8'))?.claudeAiOauth } catch { return 'usage unavailable: no OAuth credentials found.' }
+  try { cred = JSON.parse(readFileSync(CRED_FILE, 'utf8'))?.claudeAiOauth } catch { return { ok: false, message: 'usage unavailable: no OAuth credentials found.' } }
   const token = cred?.accessToken
-  if (!token) return 'usage unavailable: no OAuth access token.'
+  if (!token) return { ok: false, message: 'usage unavailable: no OAuth access token.' }
   // Don't hard-fail on a past expiresAt: the main Claude Code process rotates the token every ~8h and rewrites this
   // file, leaving a brief window each rotation where it still shows the just-expired token before the refresh lands.
   // Attempt the call regardless — a fresh/grace token goes through; a genuinely dead token 401s below (handled there).
@@ -2501,21 +2515,29 @@ async function buildUsageReply(): Promise<string> {
     if (!res.ok && res.status !== 429) {
       process.stderr.write(`discord /usage: ${res.status} ${await res.text()}\n`)
       // 401 = the token really is dead (past the rotation window) -> the actionable message; else surface the raw status.
-      return res.status === 401
+      return { ok: false, message: res.status === 401
         ? 'usage unavailable: OAuth token expired — open Claude Code to refresh it.'
-        : `usage unavailable: API returned ${res.status}.`
+        : `usage unavailable: API returned ${res.status}.` }
     }
     data = await res.json() as Record<string, any>
   } catch (e) {
     process.stderr.write(`discord /usage: fetch failed: ${e}\n`)
-    return 'usage unavailable: could not reach the usage API.'
+    return { ok: false, message: 'usage unavailable: could not reach the usage API.' }
   } finally {
     clearTimeout(timer)
   }
 
-  // Plan tier, normalized like the usage CLI (strip the default_claude_ prefix).
+  // Plan tier, normalized like the usage CLI (strip the default_claude_ prefix). Read here (not in
+  // render) because it comes from the same credential file this function already opened.
   const planRaw = cred.rateLimitTier ?? cred.subscriptionType ?? 'unknown'
-  const plan = String(planRaw).replace(/^default_claude_/, '')
+  data.__plan = String(planRaw).replace(/^default_claude_/, '')
+  return { ok: true, data }
+}
+
+// The pure formatting half — runs on EVERY call, so a cached response still renders fresh relative
+// time ("resets in 3h"), rather than serving a 60s-stale rendered string.
+function renderUsage(data: Record<string, any>): string {
+  const plan = data.__plan ?? 'unknown'
   const lines: string[] = [`**Usage** · plan: ${plan}`]
   let any = false
   for (const [apiKey, label] of [
@@ -2725,14 +2747,10 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       return
     }
 
-    // /usage — owner-gated: reveals plan tier, utilization, and extra-usage
-    // dollars, and the reply is ephemeral-only, so restrict to allowFrom.
+    // /usage — ephemeral, anyone can invoke (same as /status; VoX 2026-07-24). The reply is
+    // ephemeral so only the caller sees it, and the upstream response is cached for 60s
+    // (usageCache) so opening it up can't turn into a stampede on the usage API.
     if (cmd === 'usage') {
-      const access = loadAccess()
-      if (!access.allowFrom.includes(interaction.user.id)) {
-        await interaction.reply({ content: 'Not authorized.', flags: MessageFlags.Ephemeral }).catch(() => {})
-        return
-      }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {})
       try {
         const reply = await buildUsageReply()
@@ -3161,6 +3179,23 @@ client.once('ready', c => {
   startPresenceWatcher()
   void syncSlashCommands(c.user.id)
 })
+
+// Self-test for the /usage path (DISCORD_USAGE_SELFTEST=1): exercises the REAL buildUsageReply +
+// usageCache twice and reports whether the second call was served from cache, then exits. Lets the
+// open-to-everyone + 60s-cache change be verified end to end without needing a Discord interaction.
+if (process.env.DISCORD_USAGE_SELFTEST === '1') {
+  const t0 = Date.now(); const a = await buildUsageReply(); const t1 = Date.now()
+  const b = await buildUsageReply(); const t2 = Date.now()
+  const [c, d] = await Promise.all([buildUsageReply(), buildUsageReply()])   // concurrent, warm
+  console.log(JSON.stringify({
+    firstMs: t1 - t0, secondMs: t2 - t1,
+    identical: a === b && b === c && c === d,
+    cacheFresh: usageCache.isFresh(),
+    ttlMs: USAGE_CACHE_TTL_MS,
+    firstLine: a.split('\n')[0],
+  }, null, 2))
+  process.exit(0)
+}
 
 client.login(TOKEN).catch(err => {
   process.stderr.write(`discord channel: login failed: ${err}\n`)

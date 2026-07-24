@@ -971,3 +971,38 @@ export function removeGroup(groups: Record<string, GroupPolicyLike>, channelId: 
   return true
 }
 
+
+// ── TTL cache with in-flight de-duplication ──
+// Used by /usage: the command is now open to every user, so a busy channel could hammer the
+// upstream usage API. Two distinct problems, both handled here:
+//   1. repeat calls inside the TTL reuse the last value (the obvious cache)
+//   2. CONCURRENT calls on a cold cache share ONE in-flight request (the stampede)
+// (2) is why this caches the PROMISE rather than the resolved value — with a value-only cache,
+// N callers arriving before the first response all miss and all fetch.
+//
+// Rejections are never cached: a failed fetch clears the slot so the next caller retries rather
+// than being served a cached error for the rest of the TTL.
+export type TtlCache<T> = {
+  /** Returns the cached value, or calls `fetcher` — de-duplicating concurrent misses. */
+  get(fetcher: () => Promise<T>, now?: number): Promise<T>
+  /** Drop whatever is cached (used by tests and any future manual refresh). */
+  clear(): void
+  /** Is there a live (non-expired) entry right now? Exposed for tests/introspection. */
+  isFresh(now?: number): boolean
+}
+
+export function makeTtlCache<T>(ttlMs: number): TtlCache<T> {
+  let entry: { promise: Promise<T>; at: number } | null = null
+  return {
+    get(fetcher, now = Date.now()) {
+      if (entry && now - entry.at < ttlMs) return entry.promise
+      const rec = { promise: fetcher(), at: now }
+      entry = rec
+      // Don't let a failure poison the cache for the rest of the TTL.
+      rec.promise.catch(() => { if (entry === rec) entry = null })
+      return rec.promise
+    },
+    clear() { entry = null },
+    isFresh(now = Date.now()) { return !!entry && now - entry.at < ttlMs },
+  }
+}

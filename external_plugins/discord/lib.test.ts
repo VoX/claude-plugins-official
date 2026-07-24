@@ -2,7 +2,7 @@ import { test, expect, describe } from 'bun:test'
 import {
   safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, composePresence, withContextPrefix,
   resolveColorInput, validatePermissionNames, kindToChannelType, channelTypeToKind,
-  buildServerSpec, computeSpecDiff, renderSpecDiff, overwriteEditMap, grantGroup, removeGroup,
+  buildServerSpec, computeSpecDiff, renderSpecDiff, overwriteEditMap, grantGroup, removeGroup, makeTtlCache,
   type RawGuildState, type ServerSpec,
 } from './lib'
 
@@ -815,5 +815,67 @@ describe('grantGroup / removeGroup', () => {
 
   test('remove of an unknown channel reports false', () => {
     expect(removeGroup({}, '123')).toBe(false)
+  })
+})
+
+describe('makeTtlCache (used by /usage now that it is open to everyone)', () => {
+  test('a cold cache calls the fetcher', async () => {
+    const c = makeTtlCache<number>(60_000)
+    let calls = 0
+    expect(await c.get(async () => { calls++; return 7 }, 1000)).toBe(7)
+    expect(calls).toBe(1)
+  })
+
+  test('a second call inside the TTL does NOT re-fetch', async () => {
+    const c = makeTtlCache<number>(60_000)
+    let calls = 0
+    const f = async () => { calls++; return calls }
+    await c.get(f, 1000)
+    await c.get(f, 30_000)          // 29s later, still inside 60s
+    await c.get(f, 60_999)          // 59.999s later, still inside
+    expect(calls).toBe(1)
+  })
+
+  test('past the TTL it re-fetches', async () => {
+    const c = makeTtlCache<number>(60_000)
+    let calls = 0
+    const f = async () => { calls++; return calls }
+    expect(await c.get(f, 1000)).toBe(1)
+    expect(await c.get(f, 61_001)).toBe(2)   // 60.001s later
+    expect(calls).toBe(2)
+  })
+
+  // The teeth for the stampede requirement: a value-only cache passes every test above and
+  // still fires N upstream requests when N users hit /usage simultaneously on a cold cache.
+  test('concurrent callers on a COLD cache share ONE in-flight request', async () => {
+    const c = makeTtlCache<string>(60_000)
+    let calls = 0
+    let release!: (v: string) => void
+    const gate = new Promise<string>((r) => { release = r })
+    const f = () => { calls++; return gate }
+
+    const all = Promise.all([c.get(f, 1000), c.get(f, 1000), c.get(f, 1000), c.get(f, 1000)])
+    release('shared')
+    expect(await all).toEqual(['shared', 'shared', 'shared', 'shared'])
+    expect(calls).toBe(1)
+  })
+
+  test('a failed fetch is NOT cached — the next caller retries', async () => {
+    const c = makeTtlCache<string>(60_000)
+    let calls = 0
+    const f = async () => { calls++; if (calls === 1) throw new Error('boom'); return 'ok' }
+    await expect(c.get(f, 1000)).rejects.toThrow('boom')
+    expect(await c.get(f, 1001)).toBe('ok')   // immediately after, inside the TTL
+    expect(calls).toBe(2)
+  })
+
+  test('isFresh tracks the window, clear() drops it', async () => {
+    const c = makeTtlCache<number>(60_000)
+    expect(c.isFresh(1000)).toBe(false)
+    await c.get(async () => 1, 1000)
+    expect(c.isFresh(30_000)).toBe(true)
+    expect(c.isFresh(61_001)).toBe(false)
+    c.clear()
+    expect(c.isFresh(30_000)).toBe(false)
   })
 })
