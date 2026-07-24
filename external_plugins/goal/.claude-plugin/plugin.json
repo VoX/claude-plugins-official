@@ -1,6 +1,6 @@
 {
   "name": "goal",
   "description": "Set yourself a goal and keep working until it's met. A Stop hook refuses to let the session end while a goal is open; completion is self-reported with evidence and then verified. Hard caps (iterations, deadline, kill switch) always win.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "keywords": ["goal", "hook", "stop", "persistence", "mcp"]
 }

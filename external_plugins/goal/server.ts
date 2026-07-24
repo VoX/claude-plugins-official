@@ -40,6 +40,11 @@ const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] })
  */
 function verify(condition: string, evidence: string): { met: boolean; reason: string } {
   const model = process.env.GOAL_VERIFY_MODEL || 'claude-sonnet-5'
+  // The judge is a full `claude -p` with file access, so on a real claim it goes and READS things —
+  // git refs, the changed files, the deployed copy. That thoroughness is the point (it caught nothing
+  // wrong here, but it independently re-derived every claim), and it is also slow. 120s timed out a
+  // legitimate verification live on 2026-07-24. Default 5 min, overridable.
+  const timeoutMs = Number(process.env.GOAL_VERIFY_TIMEOUT_MS) || 300_000
   try {
     const res = spawnSync(
       'claude',
@@ -49,11 +54,17 @@ function verify(condition: string, evidence: string): { met: boolean; reason: st
        '--settings', JSON.stringify({ disableAllHooks: true })],
       {
         encoding: 'utf8',
-        timeout: 120_000,
+        timeout: timeoutMs,
         env: { ...process.env, GOAL_JUDGE: '1', VOX_PLUGINS_ENABLED: '0' },
       },
     )
-    if (res.error) return { met: false, reason: `verifier failed to run: ${res.error.message}` }
+    if (res.error) {
+      const timedOut = /ETIMEDOUT/i.test(res.error.message)
+      return { met: false, reason: timedOut
+        ? `the verifier TIMED OUT after ${Math.round(timeoutMs / 1000)}s — this is NOT a judgement on your evidence. `
+          + `Do not rewrite it; retry, or raise GOAL_VERIFY_TIMEOUT_MS. Long evidence makes the judge read more files and take longer.`
+        : `verifier failed to run: ${res.error.message}` }
+    }
     if (res.status !== 0) return { met: false, reason: `verifier exited ${res.status}: ${(res.stderr || '').slice(0, 300)}` }
     return parseVerdict(res.stdout || '')
   } catch (err) {
