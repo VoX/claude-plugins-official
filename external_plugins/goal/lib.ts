@@ -161,10 +161,26 @@ export function describe(state: GoalState | null, now: number): string {
 export function parseVerdict(raw: string): { met: boolean; reason: string } {
   const text = (raw ?? '').trim()
   if (!text) return { met: false, reason: 'verifier returned nothing' }
-  const firstLine = text.split('\n').find((l) => l.trim().length > 0)?.trim() ?? ''
-  const met = /^MET\b/i.test(firstLine)
-  const reason = text.replace(/^MET\b[:\s-]*/i, '').replace(/^NOT[_\s]?MET\b[:\s-]*/i, '').trim()
-  return { met, reason: reason || firstLine || text }
+
+  // Scan EVERY line for a verdict, not just the first. Found live 2026-07-24: the judge wrote a
+  // sentence of preamble and put "MET — ..." on the second line, so a first-line-only check scored
+  // a genuine pass as a failure. Instructing the judge not to do that is not enough on its own --
+  // it's a language model, so the parser has to tolerate it.
+  //
+  // Markdown is stripped first because judges like to bold the verdict (**MET**).
+  const lines = text.split('\n').map((l) => l.trim().replace(/^[*_`#>\s-]+/, '')).filter(Boolean)
+  const notMet = lines.some((l) => /^NOT[_\s-]?MET\b/i.test(l))
+  const metLine = lines.find((l) => /^MET\b/i.test(l))
+
+  // Fail CLOSED and rejection-first: a NOT_MET anywhere beats a MET anywhere. A judge that hedges
+  // both ways is not a pass, and "NOT_MET: ... the agent claimed MET" must never read as success.
+  const met = !notMet && !!metLine
+
+  const verdictLine = notMet
+    ? lines.find((l) => /^NOT[_\s-]?MET\b/i.test(l))!
+    : (metLine ?? lines[0])
+  const reason = verdictLine.replace(/^NOT[_\s-]?MET\b[:\s—-]*/i, '').replace(/^MET\b[:\s—-]*/i, '').trim()
+  return { met, reason: reason || verdictLine || text }
 }
 
 /** The prompt handed to the verifier subprocess. Kept here so it's testable and reviewable. */
@@ -178,7 +194,8 @@ export function buildJudgePrompt(condition: string, evidence: string): string {
     'EVIDENCE THE AGENT PROVIDED:',
     evidence,
     '',
-    'Reply with exactly one line starting with either MET or NOT_MET, then a short reason.',
+    'Your reply MUST BEGIN with either MET or NOT_MET as the very first characters — no preamble, no',
+    'restating the question, no markdown before it. Then a short reason on the same line.',
     'Answer MET only if the evidence contains something concrete and checkable (commands run and their output,',
     'files changed, tests passing with counts). Answer NOT_MET if the evidence is vague, asserts success without',
     'showing it, describes intent rather than result, or does not actually address the goal as written.',

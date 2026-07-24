@@ -167,6 +167,40 @@ suite('parseVerdict', () => {
   test('"MET" must lead -- a mention later in the text does not count', () => {
     expect(parseVerdict('NOT_MET: the goal was not MET at all').met).toBe(false)
   })
+
+  // Regression, found LIVE on the first real goal: the judge wrote a sentence of preamble and put
+  // "MET — ..." on a later line. A first-line-only check scored a genuine pass as a failure and the
+  // goal stayed open. Unit tests all fed a first-line verdict, so nothing caught it.
+  test('a verdict on a LATER line still counts (judge wrote a preamble)', () => {
+    const real = [
+      'The deployed copy has the identical real implementation, not a stub. Every checkable claim verified.',
+      '',
+      'MET — every checkable claim verified independently: git refs show the commit pushed.',
+    ].join('\n')
+    const v = parseVerdict(real)
+    expect(v.met).toBe(true)
+    expect(v.reason).toContain('every checkable claim verified')
+  })
+
+  test('a bolded verdict counts (**MET**)', () => {
+    expect(parseVerdict('**MET** — tests pass').met).toBe(true)
+    expect(parseVerdict('**NOT_MET** — no evidence').met).toBe(false)
+  })
+
+  // Fail closed: a hedging judge is not a pass, whichever order the two verdicts appear in.
+  test('NOT_MET anywhere beats MET anywhere', () => {
+    expect(parseVerdict('MET on the code change.\nNOT_MET on the deploy.').met).toBe(false)
+    expect(parseVerdict('NOT_MET on the deploy.\nMET on the code change.').met).toBe(false)
+  })
+
+  test('prose with no verdict line at all is still NOT met', () => {
+    expect(parseVerdict('It looks like the agent did the work correctly and thoroughly.').met).toBe(false)
+  })
+
+  test('NOT-MET and NOT MET spellings are caught too', () => {
+    expect(parseVerdict('NOT-MET: nope').met).toBe(false)
+    expect(parseVerdict('NOT MET: nope').met).toBe(false)
+  })
 })
 
 suite('buildJudgePrompt', () => {
