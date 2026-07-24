@@ -2478,7 +2478,9 @@ async function buildUsageReply(): Promise<string> {
   try { cred = JSON.parse(readFileSync(CRED_FILE, 'utf8'))?.claudeAiOauth } catch { return 'usage unavailable: no OAuth credentials found.' }
   const token = cred?.accessToken
   if (!token) return 'usage unavailable: no OAuth access token.'
-  if (cred.expiresAt && cred.expiresAt < Date.now()) return 'usage unavailable: OAuth token expired — open Claude Code to refresh it.'
+  // Don't hard-fail on a past expiresAt: the main Claude Code process rotates the token every ~8h and rewrites this
+  // file, leaving a brief window each rotation where it still shows the just-expired token before the refresh lands.
+  // Attempt the call regardless — a fresh/grace token goes through; a genuinely dead token 401s below (handled there).
 
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 10000)
@@ -2498,7 +2500,10 @@ async function buildUsageReply(): Promise<string> {
     // body on 429 too — only bail on other non-OK statuses.
     if (!res.ok && res.status !== 429) {
       process.stderr.write(`discord /usage: ${res.status} ${await res.text()}\n`)
-      return `usage unavailable: API returned ${res.status}.`
+      // 401 = the token really is dead (past the rotation window) -> the actionable message; else surface the raw status.
+      return res.status === 401
+        ? 'usage unavailable: OAuth token expired — open Claude Code to refresh it.'
+        : `usage unavailable: API returned ${res.status}.`
     }
     data = await res.json() as Record<string, any>
   } catch (e) {
