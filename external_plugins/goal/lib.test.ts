@@ -83,6 +83,42 @@ suite('decideStop', () => {
   })
 })
 
+suite('spokeThisTurn (channel-bot spam guard)', () => {
+  test('having said nothing, the block does not nag about silence', () => {
+    const d = decideStop(goal({ spokeThisTurn: 0 }), T0)
+    if (d.action !== 'block') throw new Error('expected block')
+    expect(d.reason).not.toContain('ALREADY SENT')
+  })
+
+  // The teeth: without this, a blocked stop after a reply produces a SECOND reply, and one user
+  // request turns into up to max_iterations messages at the human.
+  test('having already replied, the block orders silence', () => {
+    const d = decideStop(goal({ spokeThisTurn: 1 }), T0)
+    if (d.action !== 'block') throw new Error('expected block')
+    expect(d.reason).toContain('ALREADY SENT 1 message')
+    expect(d.reason).toMatch(/SILENTLY|Do NOT send another/)
+  })
+
+  test('the count is reported so repeated spam is visible', () => {
+    const d = decideStop(goal({ spokeThisTurn: 4 }), T0)
+    if (d.action !== 'block') throw new Error('expected block')
+    expect(d.reason).toContain('ALREADY SENT 4 message')
+  })
+
+  test('a blocked stop is explicitly NOT a new turn', () => {
+    const d = decideStop(goal({ spokeThisTurn: 2 }), T0)
+    if (d.action !== 'block') throw new Error('expected block')
+    expect(d.reason).toContain('not a new turn')
+  })
+
+  test('undefined (pre-existing state files) is treated as not-yet-spoken', () => {
+    const g = goal(); delete (g as any).spokeThisTurn
+    const d = decideStop(g, T0)
+    if (d.action !== 'block') throw new Error('expected block')
+    expect(d.reason).not.toContain('ALREADY SENT')
+  })
+})
+
 suite('caps', () => {
   test('defaults apply when unspecified', () => {
     expect(clampMaxIterations(null)).toBe(DEFAULT_MAX_ITERATIONS)

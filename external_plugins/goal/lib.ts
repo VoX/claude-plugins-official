@@ -21,6 +21,14 @@ export interface GoalState {
   sessionId: string | null
   /** Set while complete_goal is being judged, so a concurrent Stop doesn't double-count. */
   verifying?: boolean
+  /**
+   * How many user-visible messages have already gone out this turn (reply/bulk_reply/send_embed/...).
+   * Channel-bot specific hazard, caught by BMO 2026-07-24: for a bot on Discord/Slack, SENDING and
+   * STOPPING are different events. A blocked stop after an already-sent reply invites a SECOND reply,
+   * and a stream of them if the judge keeps rejecting -- i.e. the goal plugin spams the human it is
+   * working for. Tracked by a PreToolUse hook, reset each new user turn.
+   */
+  spokeThisTurn?: number
 }
 
 /** What the Stop hook should do. `release` means the goal ends WITHOUT being met. */
@@ -91,12 +99,21 @@ export function decideStop(
   const next = state.iterations + 1
   const remaining = state.maxIterations - next
   const last = state.lastReason ? `\nLast verdict: ${state.lastReason}` : ''
+  // See GoalState.spokeThisTurn. Without this the natural move after a blocked stop is to reply
+  // again, so one request turns into up to max_iterations messages at the human.
+  const spoke = state.spokeThisTurn ?? 0
+  const silence = spoke > 0
+    ? `\n\nYOU HAVE ALREADY SENT ${spoke} message(s) to the channel this turn. Do NOT send another ` +
+      `now — keep working SILENTLY. Speak again only when the goal completes, is abandoned, or is ` +
+      `released, and then send ONE message. A blocked stop is not a new turn.`
+    : ''
   return {
     action: 'block',
     nextIterations: next,
     reason:
       `You set yourself this goal and it is not finished:\n\n  ${state.condition}\n` +
       last +
+      silence +
       `\n\nKeep working on it. When it is genuinely done call complete_goal with concrete evidence ` +
       `(what you changed, what you ran, what the output was) — the claim gets verified, so vague ` +
       `evidence will be rejected and cost you an iteration. If it cannot be done, call abandon_goal ` +

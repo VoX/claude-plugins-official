@@ -9,6 +9,27 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__(plugin_)?(discord|slack)(_(discord|slack))?__(reply|bulk_reply|send_embed|send_voice_message)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"${CLAUDE_PLUGIN_ROOT}\"/hooks/spoke.ts"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"${CLAUDE_PLUGIN_ROOT}\"/hooks/new-turn.ts"
+          }
+        ]
+      }
     ]
   }
 }
