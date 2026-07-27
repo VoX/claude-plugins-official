@@ -50,7 +50,7 @@ import {
   type PermissionResolvable,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, copyFileSync, unlinkSync, appendFileSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, copyFileSync, unlinkSync, appendFileSync, existsSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join, sep, dirname } from 'path'
 import sharp from 'sharp'
@@ -2730,6 +2730,222 @@ async function buildStatusReply(): Promise<string> {
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
+// --- /login: owner-driven re-authentication ---------------------------------------------------
+//
+// This can live in-process at all because being "logged out" does not kill anything: `claude` is
+// still running, this MCP server with it, and the gateway stays connected — only *inference* calls
+// fail. That is exactly why /status still answers "Login expired · Please run /login" instead of
+// going silent. So the bot can accept a slash command and repair its own credentials, with no SSH,
+// no second service, and no second bot token.
+//
+// `claude auth login` is an interactive TUI: it prints an authorization URL, then blocks on
+// "Paste code here if prompted >". Two properties of it shape everything below.
+//
+//  1. It needs a TTY. Bun.spawn gives pipes, not a pty, and without one the prompt never arrives.
+//     util-linux's `script` allocates a pty for us, so this needs no native module.
+//  2. The URL embeds a PKCE `code_challenge` and a `state` bound to THAT process. The process must
+//     therefore stay alive across the owner's trip to the browser — we cannot print the URL, exit,
+//     and re-spawn `claude auth login` when the code comes back, because the challenge would no
+//     longer match the code. Hence a held session rather than two independent commands.
+//
+// The redirect_uri is https://platform.claude.com/oauth/code/callback — Anthropic hosts it and
+// shows the user a code to copy — so no localhost callback, tunnel, or browser on the box.
+// `script -c` runs its argument through /bin/sh, so this path is interpolated into a SHELL STRING
+// and must be quoted. It is $HOME-derived and nothing from Discord reaches it, but that is one
+// refactor away from being an injection sink. Fall back to PATH if the pinned path is absent.
+const CLAUDE_BIN = (() => {
+  const pinned = join(process.env.HOME ?? '', '.local/bin/claude')
+  try { return existsSync(pinned) ? pinned : 'claude' } catch { return 'claude' }
+})()
+const shq = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`
+
+const LOGIN_TIMEOUT_MS = 10 * 60_000        // a generous browser round-trip before we give up
+const LOGIN_URL_WAIT_MS = 45_000            // how long to wait for the URL to appear
+const LOGIN_FINISH_WAIT_MS = 90_000         // how long to wait for the code to be accepted
+
+type LoginSession = {
+  proc: ReturnType<typeof Bun.spawn>
+  out: string                                // rolling stdout; never contains the code (we only write it)
+  url: string
+  startedAt: number
+  timer: ReturnType<typeof setTimeout>
+}
+let loginSession: LoginSession | null = null
+
+/**
+ * Tear down a specific session. Takes the session because the caller's `sess` and the module-global
+ * `loginSession` diverge the moment two /login runs overlap: a slow first attempt timing out would
+ * otherwise kill the SECOND attempt's live process and null the global, stranding the owner who is
+ * already holding a valid code. Only clear the global when it still points at this session.
+ */
+function endLoginSession(sess: LoginSession | null = loginSession): void {
+  if (!sess) return
+  clearTimeout(sess.timer)
+  try {
+    sess.proc.kill()
+    // `script` may outlive its child; SIGKILL the group shortly after as insurance against an
+    // abandoned `claude` holding ~200 MB against the unit's MemoryMax.
+    setTimeout(() => { try { sess.proc.kill(9) } catch { /* gone */ } }, 2000)
+  } catch { /* already gone */ }
+  if (loginSession === sess) loginSession = null
+}
+
+/** Strip ANSI CSI and OSC-8 hyperlink escapes so the URL can be matched in plain text. */
+function stripAnsi(s: string): string {
+  return s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\x1b\]8;[^\x07\x1b]*(\x07|\x1b\\)?/g, '')
+}
+
+/**
+ * The authorization URL, or ''. Anchored to end at `state=…` because the TUI emits the URL twice
+ * (once inside an OSC-8 hyperlink, once as visible text) — a greedy match would splice both into
+ * one unusable string.
+ */
+function extractLoginUrl(out: string): string {
+  const stripped = stripAnsi(out)
+  const m = stripped.match(/https:\/\/claude\.com\/[^\s\x07\x1b"']*?state=[A-Za-z0-9_-]+/)
+  if (!m || m.index === undefined) return ''
+  // `state` has no right-hand anchor, so a buffer caught mid-write matches a PREFIX of it and yields
+  // a link that dies at Anthropic with a state mismatch — silently, from the owner's side. If the
+  // match runs to the end of what we have, we are probably mid-chunk: wait for more. The real stream
+  // always continues with "\r\nPaste code here if prompted > ", so this costs nothing.
+  if (m.index + m[0].length >= stripped.length) return ''
+  return m[0]
+}
+
+/**
+ * Has the child stopped? `exitCode` alone is NOT liveness in Bun: after a signal kill it stays null
+ * for ever and only `signalCode` is set, so an exitCode-only check waits out the full deadline on an
+ * already-dead process — and would happily write a code into a dead pipe.
+ */
+const procDead = (p: ReturnType<typeof Bun.spawn>) => p.exitCode !== null || p.signalCode !== null
+
+/** Poll the session's rolling output until `test` passes, the process exits, or we time out. */
+async function waitForOutput(sess: LoginSession, test: (out: string) => boolean, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms
+  while (Date.now() < deadline) {
+    if (test(sess.out)) return true
+    if (procDead(sess.proc)) return test(sess.out)
+    await new Promise(r => setTimeout(r, 250))
+  }
+  return test(sess.out)
+}
+
+/**
+ * When the current access token expires, or null if there are no credentials.
+ *
+ * `claude auth status` reports `loggedIn: true` for a credentials file whose token expired years
+ * ago — it checks EXISTENCE, not validity. Using it as the health check made /login refuse to run in
+ * the exact state it exists for ("Already logged in — nothing to do." while /status says "Login
+ * expired"). The expiry on disk is the real signal, and the plugin already reads it this way in
+ * summarizeViaHaiku.
+ */
+function credExpiry(): number | null {
+  try {
+    const v = JSON.parse(readFileSync(CRED_FILE, 'utf8'))?.claudeAiOauth?.expiresAt
+    return typeof v === 'number' ? v : null
+  } catch { return null }
+}
+
+/** Usable credentials = present AND not expired. */
+function authHealthy(): boolean {
+  const exp = credExpiry()
+  return exp !== null && exp > Date.now()
+}
+
+/** Start `claude auth login` on a pty and wait for it to print the authorization URL. */
+async function startLogin(): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  endLoginSession()
+  let proc: ReturnType<typeof Bun.spawn>
+  try {
+    // `script -qec <cmd> /dev/null` runs <cmd> under a pty and discards the typescript file.
+    // stderr is ignored rather than piped: an unread pipe deadlocks the child once it fills.
+    proc = Bun.spawn(['script', '-qec', `${shq(CLAUDE_BIN)} auth login --claudeai`, '/dev/null'],
+      { stdin: 'pipe', stdout: 'pipe', stderr: 'ignore' })
+  } catch (e) {
+    return { ok: false, error: `could not start the login process: ${String(e).slice(0, 200)}` }
+  }
+
+  // Built in two steps so the idle timer can reference its OWN session rather than whatever is
+  // current when it fires — the same aliasing bug as endLoginSession's default argument.
+  const sess: LoginSession = { proc, out: '', url: '', startedAt: Date.now(), timer: undefined as any }
+  sess.timer = setTimeout(() => {
+    process.stderr.write('discord /login: session expired unused\n')
+    endLoginSession(sess)
+  }, LOGIN_TIMEOUT_MS)
+  loginSession = sess
+
+  // Pump stdout into the session buffer. Bounded, so a chatty TUI cannot grow it without limit.
+  ;(async () => {
+    const dec = new TextDecoder()
+    try {
+      for await (const chunk of proc.stdout as any) {
+        sess.out += dec.decode(chunk as Uint8Array, { stream: true })
+        if (sess.out.length > 64_000) sess.out = sess.out.slice(-32_000)
+      }
+    } catch { /* stream closed with the process */ }
+  })()
+
+  const got = await waitForOutput(sess, o => extractLoginUrl(o) !== '', LOGIN_URL_WAIT_MS)
+  if (!got) {
+    const tail = stripAnsi(sess.out).trim().slice(-200)
+    endLoginSession(sess)
+    // Surface the tail: the real cause (e.g. "sh: claude: not found") is sitting in it, and the pty
+    // does not echo the code, so there is nothing sensitive in this buffer.
+    return { ok: false, error: 'the login process did not produce an authorization URL in time' + (tail ? `\n\`\`\`\n${tail}\n\`\`\`` : '') }
+  }
+  sess.url = extractLoginUrl(sess.out)
+  return { ok: true, url: sess.url }
+}
+
+/**
+ * Feed the authorization code to the waiting process and report whether auth actually took.
+ * The code is written to the pty and never logged, echoed, or stored.
+ */
+async function finishLogin(code: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const sess = loginSession
+  if (!sess) return { ok: false, error: 'no login is in progress — run `/login` first (the code is tied to that attempt)' }
+  if (procDead(sess.proc)) { endLoginSession(sess); return { ok: false, error: 'the login attempt already exited — run `/login` again' } }
+  // Success must be judged by the credentials CHANGING. A rejected code exits non-zero and leaves the
+  // file untouched, so any existence-style check would read the stale credentials back and report
+  // success — then restart the bot into the same broken state.
+  const before = credExpiry()
+
+  try {
+    sess.proc.stdin.write(code + '\n')
+    sess.proc.stdin.flush()
+  } catch (e) {
+    endLoginSession(sess)
+    return { ok: false, error: `could not send the code: ${String(e).slice(0, 200)}` }
+  }
+
+  // Wait for the process to finish, then ask `claude auth status` — the TUI's wording is not a
+  // contract, the status command is.
+  await waitForOutput(sess, () => procDead(sess.proc), LOGIN_FINISH_WAIT_MS)
+  const after = credExpiry()
+  endLoginSession(sess)
+  const advanced = after !== null && after !== before && after > Date.now()
+  return advanced ? { ok: true } : { ok: false, error: 'the code was rejected or the login did not complete — run `/login` to try again' }
+}
+
+/**
+ * Restart the bot service so the freshly authenticated credentials are picked up. Detached via
+ * setsid and delayed, because the restart kills this very process — an attached child would die
+ * with us before it could act, and an immediate one would cut off the reply we just sent.
+ */
+function restartUnit(): string | null {
+  const unit = process.env.DISCORD_LOGIN_RESTART_UNIT?.trim()
+    || (process.env.BOT_SESSION_NAME?.trim() ? `claude-discord@${process.env.BOT_SESSION_NAME!.trim()}` : '')
+  // Interpolated into a shell string below, so validate rather than trust the environment.
+  return unit && /^[A-Za-z0-9@._-]+$/.test(unit) ? unit : null
+}
+
+function scheduleSelfRestart(unit: string): void {
+  try {
+    Bun.spawn(['setsid', 'sh', '-c', `sleep 3; systemctl --user restart ${shq(unit)}`],
+      { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+  } catch { /* the owner is already told to restart manually if I stay stuck */ }
+}
+
 client.on('interactionCreate', async (interaction: Interaction) => {
   // Slash commands — early dispatch.
   if (interaction.isChatInputCommand()) {
@@ -2758,6 +2974,61 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       } catch (e) {
         await interaction.editReply({ content: `usage failed: ${safeSlice(String(e), 200)}` }).catch(() => {})
       }
+      return
+    }
+
+    // /login — owner-only re-authentication. Gated on DISCORD_OWNER_ID exactly like /access, and
+    // fails CLOSED: with no owner configured nobody is authorized, because this command can move
+    // the account's credentials. Every reply is ephemeral; the authorization code arrives as an
+    // interaction option and is never written to a channel, a log, or disk by us.
+    if (cmd === 'login') {
+      const owner = process.env.DISCORD_OWNER_ID?.trim()
+      if (!owner || interaction.user.id !== owner) {
+        await interaction.reply({ content: 'Not authorized.', flags: MessageFlags.Ephemeral }).catch(() => {})
+        return
+      }
+      const code = interaction.options.getString('code')?.trim() ?? ''
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {})
+
+      // Step 2: finish an attempt that is already waiting on its code.
+      if (code) {
+        const done = await finishLogin(code)
+        if (!done.ok) {
+          await interaction.editReply({ content: `❌ ${done.error}` }).catch(() => {})
+          return
+        }
+        // Reply FIRST, then arm the restart. The restart tears down this cgroup (KillMode=
+        // control-group), so spawning it before the reply races a 3s timer against discord.js's REST
+        // queue — lose that race and the owner is left with a spinner and no idea if it worked.
+        const unit = restartUnit()
+        await interaction.editReply({
+          content: '✅ Logged in.' + (unit
+            ? ` Restarting \`${unit}\` in a moment to pick it up — I'll go quiet briefly.`
+            : ' Could not work out which service to restart (set `DISCORD_LOGIN_RESTART_UNIT`), so restart it yourself if I stay stuck.'),
+        }).catch(() => {})
+        if (unit) scheduleSelfRestart(unit)
+        return
+      }
+
+      // Step 1: start an attempt and hand back the URL. Held open until the code arrives.
+      // Judged on the token's EXPIRY, not on the credentials file merely existing — see credExpiry().
+      if (authHealthy()) {
+        await interaction.editReply({
+          content: 'Already logged in — nothing to do. (Run `/login code:<code>` only after a `/login` that handed you a link.)',
+        }).catch(() => {})
+        return
+      }
+      const started = await startLogin()
+      if (!started.ok) {
+        await interaction.editReply({ content: `❌ ${started.error}` }).catch(() => {})
+        return
+      }
+      await interaction.editReply({
+        content:
+          `**Sign in, then finish with \`/login code:<code>\`**\n${started.url}\n\n` +
+          `Anthropic's page shows you a code to copy. This link expires in ${Math.round(LOGIN_TIMEOUT_MS / 60_000)} minutes ` +
+          `and is tied to this attempt — if it lapses, run \`/login\` again for a fresh one.`,
+      }).catch(() => {})
       return
     }
 
@@ -3136,6 +3407,21 @@ const SLASH_COMMANDS = [
       { type: 7, name: 'channel', description: 'Target channel (defaults to the current channel)', required: false },
       { type: 5, name: 'mentions_only', description: 'Only respond when @mentioned (default true)', required: false },
     ] },
+  // /login — owner-only re-authentication, so a logged-out bot can be recovered without SSH.
+  // This works BECAUSE being logged out does not kill the bot: claude keeps running, this MCP
+  // server keeps running, and the gateway stays connected — only inference calls fail. That is
+  // why /status can still answer "Login expired · Please run /login" (VoX, 2026-07-27).
+  // The code is a command OPTION, not a chat message: it travels in the interaction payload,
+  // so an authorization code never lands in a channel and there is nothing to delete afterwards.
+  // dm_permission is deliberately NOT false (unlike /access): re-authenticating in a DM is the
+  // private, sensible place to do it, and default_member_permissions has no effect in DMs anyway.
+  // Non-owners can therefore SEE it in a DM -- the handler denies them, and UI visibility was never
+  // the authorization boundary.
+  { name: 'login',   description: 'Owner-only: re-authenticate this bot to Claude', type: 1,
+    default_member_permissions: '0',
+    options: [
+      { type: 3, name: 'code', description: 'Paste the code from the login page to finish (omit to start)', required: false },
+    ] },
 ] as const
 
 async function syncSlashCommands(appId: string): Promise<void> {
@@ -3151,8 +3437,15 @@ async function syncSlashCommands(appId: string): Promise<void> {
     // Deep diff — compare names, descriptions, and options. Discord
     // PUT bulk-overwrites idempotently, but skipping the call when the
     // set is already aligned saves an API hit per restart.
-    const normalize = (cmds: Array<{ name: string; description?: string; options?: unknown[] }>) =>
-      JSON.stringify(cmds.map(c => ({ name: c.name, description: c.description, options: c.options || [] })).sort((a, b) => a.name.localeCompare(b.name)))
+    // default_member_permissions/dm_permission are included deliberately: leaving them out means a
+    // change to ONLY a permission field never gets pushed and the diff reports "already aligned" --
+    // fail-open drift on exactly the fields that gate an owner-only command.
+    const normalize = (cmds: Array<{ name: string; description?: string; options?: unknown[]; default_member_permissions?: unknown; dm_permission?: unknown }>) =>
+      JSON.stringify(cmds.map(c => ({
+        name: c.name, description: c.description, options: c.options || [],
+        default_member_permissions: c.default_member_permissions ?? null,
+        dm_permission: c.dm_permission ?? null,
+      })).sort((a, b) => a.name.localeCompare(b.name)))
     const aligned = normalize(SLASH_COMMANDS) === normalize(current)
     if (aligned) {
       process.stderr.write(`discord: slash commands already aligned (${SLASH_COMMANDS.map(c => c.name).join(', ')})\n`)
