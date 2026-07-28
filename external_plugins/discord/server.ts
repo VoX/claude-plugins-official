@@ -2873,6 +2873,29 @@ function authHealthy(): boolean {
   return exp !== null && exp > Date.now()
 }
 
+/**
+ * Which account is currently signed in, for the /login banner.
+ *
+ * `claude auth status` is the only thing that reports the EMAIL, which is the one fact that matters
+ * when the point is switching between several accounts — the credentials file carries tier and
+ * scopes but no identity. Its `loggedIn` field is still not trustworthy (it reports true for
+ * credentials that expired years ago, see credExpiry), so this reads the identity ONLY and leaves
+ * the health verdict to credExpiry. Returns null rather than throwing: a missing banner line must
+ * never be the reason a login cannot be started.
+ */
+async function currentAccount(): Promise<string | null> {
+  try {
+    const proc = Bun.spawn([CLAUDE_BIN, 'auth', 'status'], { stdout: 'pipe', stderr: 'ignore' })
+    const out = await Promise.race([
+      new Response(proc.stdout).text(),
+      new Promise<string>(r => setTimeout(() => r(''), 8_000)),
+    ])
+    try { proc.kill() } catch { /* already gone */ }
+    const email = JSON.parse(out)?.email
+    return typeof email === 'string' && email ? email : null
+  } catch { return null }
+}
+
 // ── Auth watch: notice that Claude Code is logged out, and say so ──────────────────────────────
 //
 // Runs entirely in THIS process, which stays up when Claude Code is logged out. Anything that
@@ -3154,8 +3177,11 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         // control-group), so spawning it before the reply races a 3s timer against discord.js's REST
         // queue — lose that race and the owner is left with a spinner and no idea if it worked.
         const unit = restartUnit()
+        // Name the account landed on: with several in rotation, "logged in" alone does not tell you
+        // whether the switch went where you meant it to.
+        const nowAs = await currentAccount()
         await interaction.editReply({
-          content: '✅ Logged in.' + (unit
+          content: `✅ Logged in${nowAs ? ` as **${nowAs}**` : ''}.` + (unit
             ? ` Restarting \`${unit}\` in a moment to pick it up — I'll go quiet briefly.`
             : ' Could not work out which service to restart (set `DISCORD_LOGIN_RESTART_UNIT`), so restart it yourself if I stay stuck.'),
         }).catch(() => {})
@@ -3164,20 +3190,28 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       }
 
       // Step 1: start an attempt and hand back the URL. Held open until the code arrives.
-      // Judged on the token's EXPIRY, not on the credentials file merely existing — see credExpiry().
-      if (authHealthy()) {
-        await interaction.editReply({
-          content: 'Already logged in — nothing to do. (Run `/login code:<code>` only after a `/login` that handed you a link.)',
-        }).catch(() => {})
-        return
-      }
+      //
+      // Being logged in does NOT block this. Anthropic allows several accounts to raise total usage,
+      // and switching between them from Discord is a first-class reason to run /login (VoX,
+      // 2026-07-28) — refusing while healthy made the command useful only in the emergency case. The
+      // current account is reported in the banner instead, because "which one am I on" is the fact
+      // you actually need when juggling several, and the credentials file does not carry it.
+      // Evaluated ONCE: the access token can expire between two calls, and a banner that disagreed
+      // with itself ("already signed in" plus no account, or vice versa) would be worse than none.
+      const alreadyIn = authHealthy()
+      const signedInAs = alreadyIn ? await currentAccount() : null
+      const banner = alreadyIn
+        ? `ℹ️ Already signed in${signedInAs ? ` as **${signedInAs}**` : ''} — continuing will SWITCH accounts. `
+          + `Abandon this without submitting a code and nothing changes.\n\n`
+        : ''
+
       const started = await startLogin()
       if (!started.ok) {
         await interaction.editReply({ content: `❌ ${started.error}` }).catch(() => {})
         return
       }
       await interaction.editReply({
-        content:
+        content: banner +
           `**Sign in, then finish with \`/login code:<code>\`**\n${started.url}\n\n` +
           `Anthropic's page shows you a code to copy. This link expires in ${Math.round(LOGIN_TIMEOUT_MS / 60_000)} minutes ` +
           `and is tied to this attempt — if it lapses, run \`/login\` again for a fresh one.`,
