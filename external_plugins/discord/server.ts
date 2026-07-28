@@ -836,6 +836,15 @@ let lastRawSeen = ''                     // detect file replacement (--start) vs
 let presenceWrites: number[] = []        // epoch ms of recent publishes (pruned to the trailing window)
 let firstPendingAt = 0                   // epoch ms the current un-published batch's first event arrived
 
+// An explicit status file pins the custom status (e.g. auto-DND at high usage). Outranked by the
+// auth alarm below, since that one means the bot cannot work at all rather than merely being busy.
+const PRESENCE_STATUS_FILE = join(STATE_DIR, '.presence-status')
+// Set by the auth watcher (startAuthWatch, further down). Declared beside the other presence state
+// because tickPresence is its only reader. The hooks that drive the normal status stop firing when
+// Claude is logged out, so without this the last thing they wrote sits there looking healthy.
+let authDead = false
+const AUTH_DEAD_STATUS = '⚠ unauthenticated · run /login'
+
 function sanitizeStatus(s: string): string {
   const cleaned = s.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()
   // safeSlice (codepoint-aware) not raw .slice — a 128-UTF16-unit cut can strand a lone
@@ -848,10 +857,12 @@ const isResting = (t: string) => t === '' || isIdle(t)
 
 // The actual presence write (dot + activity text) + typing-stop. Deduped. Returns true iff an
 // actual wire write happened (so the caller only consumes a rate-limit slot on a real publish).
-function setPresenceNow(text: string): boolean {
+function setPresenceNow(text: string, alarm = false): boolean {
   // prefix the live context-window size ("565k - …") BEFORE sanitize, so the 128-cap counts the prefix
-  // too; a clear ('') stays '' (withContextPrefix leaves empty text alone).
-  text = sanitizeStatus(withContextPrefix(readContextPrefix(), text))
+  // too; a clear ('') stays '' (withContextPrefix leaves empty text alone). The alarm text skips the
+  // prefix: it is written by the plugin, not by the hooks, and the hooks' last context reading is
+  // stale by definition in the state the alarm reports.
+  text = alarm ? sanitizeStatus(text) : sanitizeStatus(withContextPrefix(readContextPrefix(), text))
   if (text === lastPresenceText) return false  // dedupe: no wire write
   lastPresenceText = text
   const resting = isResting(text)
@@ -860,7 +871,7 @@ function setPresenceNow(text: string): boolean {
     try {
       // dot: green while active, yellow (idle) when resting; the text (incl. the idle label) shows when present.
       client.user.setPresence({
-        status: resting ? 'idle' : 'online',
+        status: alarm ? 'dnd' : resting ? 'idle' : 'online',
         activities: text ? [{ name: client.user.username, state: text, type: ActivityType.Custom }] : [],
       })
     } catch { /* presence set is best-effort */ }
@@ -885,6 +896,16 @@ function setPresenceNow(text: string): boolean {
 // final action shows then the dot settles to idle. A file replacement (--start, !startsWith) resets the
 // high-water mark. No staleness backstop: a long single op holds its status (idle comes only from Stop).
 function tickPresence(): void {
+  // Dead credentials outrank everything. Held (not published once) because the normal path would
+  // otherwise overwrite it on the next hook write; setPresenceNow dedupes on text, so holding it
+  // costs zero wire writes and cannot consume the 5-per-20s budget.
+  if (authDead) { setPresenceNow(AUTH_DEAD_STATUS, true); return }
+
+  // An explicit pin (auto-DND at high usage, etc). Below the auth alarm, above the hook activity.
+  let pinned = ''
+  try { pinned = readFileSync(PRESENCE_STATUS_FILE, 'utf8').trim() } catch { /* absent = not pinned */ }
+  if (pinned) { setPresenceNow(pinned); return }
+
   let raw = ''
   try { raw = readFileSync(PRESENCE_FILE, 'utf8') } catch { /* absent = resting */ }
   if (!raw.startsWith(lastRawSeen)) { presenceShownLines = 0; firstPendingAt = 0 }  // file replaced → new turn
@@ -2852,6 +2873,138 @@ function authHealthy(): boolean {
   return exp !== null && exp > Date.now()
 }
 
+// ── Auth watch: notice that Claude Code is logged out, and say so ──────────────────────────────
+//
+// Runs entirely in THIS process, which stays up when Claude Code is logged out. Anything that
+// needed a Claude turn to detect or report would be unreachable in exactly the state it exists for.
+//
+// Deliberately NOT built on authHealthy() above, despite the tempting name. That judges the ACCESS
+// token, which lapses every ~8h in normal healthy operation — fetchUsage() says so itself: "Don't
+// hard-fail on a past expiresAt". Wiring a visible warning to it would cry wolf during any ordinary
+// idle stretch, and a warning that cries wolf is ignored on the one day it is real.
+
+type Probe = 'ok' | 'rejected' | 'unknown'
+
+/** When the REFRESH token dies — the real cliff. `known:false` means the field is absent. */
+function refreshExpiry(): { known: boolean; expiresAt: number } {
+  try {
+    const v = JSON.parse(readFileSync(CRED_FILE, 'utf8'))?.claudeAiOauth?.refreshTokenExpiresAt
+    if (typeof v === 'number') return { known: true, expiresAt: v }
+  } catch { /* unreadable → unknown */ }
+  return { known: false, expiresAt: 0 }   // not every Claude version writes this field
+}
+
+/**
+ * Ask Anthropic whether the credentials are accepted. Catches revocation, which the expiry check
+ * cannot see because a revoked token still looks perfectly valid on disk.
+ *
+ * Only 2xx proves health. In particular 429 does NOT: measured 2026-07-28, a garbage token gets 429
+ * from this endpoint, because it rate-limits BEFORE it authenticates. fetchUsage() treats 429 as
+ * usable — correct for it, since a real throttled token still returns usage buckets — but borrowing
+ * that rule here would report a revoked token as healthy. Everything that is not a clear accept or a
+ * clear reject is 'unknown', which holds the current state instead of guessing.
+ */
+async function probeAuth(): Promise<Probe> {
+  let token: string | undefined
+  try { token = JSON.parse(readFileSync(CRED_FILE, 'utf8'))?.claudeAiOauth?.accessToken } catch { return 'unknown' }
+  if (!token) return 'unknown'
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 10_000)
+  try {
+    const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
+      headers: {
+        'authorization': `Bearer ${token}`,
+        'content-type': 'application/json',
+        'anthropic-beta': 'oauth-2025-04-20',
+        'user-agent': 'claude-code/2.1.81',
+      },
+      signal: ctrl.signal,
+    })
+    if (res.status === 401 || res.status === 403) return 'rejected'
+    if (res.ok) return 'ok'
+    return 'unknown'                  // 429 / 5xx / anything else: inconclusive, see above
+  } catch { return 'unknown' }        // network/timeout proves nothing about the credentials
+  finally { clearTimeout(timer) }
+}
+
+type Verdict = 'dead' | 'alive' | 'strike' | 'hold'
+
+/**
+ * The decision, deliberately separated from the IO so it can be tested exhaustively without a
+ * network — the live endpoint rate-limits, so a probe-driven test cannot reach its own branches
+ * reliably (that is how the 429 bug above was found: two cases silently tested nothing).
+ *
+ * 'strike' means one suspicious reading, not a verdict; the caller counts them.
+ */
+function authVerdict(refresh: { known: boolean; expiresAt: number }, access: number | null,
+                     probe: Probe, now: number): Verdict {
+  if (refresh.known && refresh.expiresAt <= now) return 'dead'   // free and certain
+  // A rejection only means anything while the access token is UNEXPIRED BY ITS OWN CLAIM. An idle
+  // bot routinely holds an expired access token Claude Code has not refreshed yet; a 401 on that
+  // says nothing. Unexpired-yet-rejected means revoked.
+  if (probe === 'rejected' && access !== null && access > now) return 'strike'
+  if (probe === 'ok') return 'alive'
+  return 'hold'
+}
+
+let authProbeFails = 0
+let authDeadNotified = false
+
+function setAuthDead(why: string): void {
+  if (!authDead) process.stderr.write(`discord authwatch: ${why}\n`)
+  authDead = true
+  if (authDeadNotified) return
+  authDeadNotified = true
+  void dmOwner(`⚠️ I can't reach Claude — ${why}. Run \`/login\` here to fix it.`)
+}
+
+function setAuthAlive(): void {
+  if (authDead) process.stderr.write('discord authwatch: credentials healthy again\n')
+  authDead = false
+  authDeadNotified = false        // re-arm, so a second outage still notifies
+}
+
+async function dmOwner(text: string): Promise<void> {
+  const id = process.env.DISCORD_OWNER_ID?.trim()
+  if (!id) { process.stderr.write('discord authwatch: no DISCORD_OWNER_ID set — cannot DM\n'); return }
+  try {
+    const u = await client.users.fetch(id)
+    await u.send({ content: text })
+  } catch (e) { process.stderr.write(`discord authwatch: owner DM failed: ${String(e).slice(0, 160)}\n`) }
+}
+
+/**
+ * One evaluation pass. Order matters: the expiry check is free and certain, the probe costs a
+ * request and can be inconclusive.
+ */
+async function evaluateAuth(): Promise<void> {
+  const refresh = refreshExpiry()
+  const now = Date.now()
+  // Skip the request entirely when the expiry already settles it: free and certain beats a probe.
+  const probe: Probe = refresh.known && refresh.expiresAt <= now ? 'unknown' : await probeAuth()
+
+  switch (authVerdict(refresh, credExpiry(), probe, now)) {
+    case 'dead':   setAuthDead('the refresh token expired'); break
+    case 'strike': if (++authProbeFails >= 2) setAuthDead('the credentials were rejected'); break
+    case 'alive':  authProbeFails = 0; setAuthAlive(); break
+    case 'hold':   break        // inconclusive — keep whatever state we already had
+  }
+}
+
+const AUTH_WATCH_MS = 5 * 60_000
+
+function startAuthWatch(): void {
+  // NOT gated on the presence flags. With DISCORD_PRESENCE_ACTIVITY off there is no status to show,
+  // and the owner DM becomes the ONLY signal that instance has — so the watcher must run regardless
+  // of whether anything can be displayed.
+  if (!refreshExpiry().known) {
+    process.stderr.write('discord authwatch: no refreshTokenExpiresAt in credentials — '
+      + 'expiry check disabled on this instance, relying on the API probe alone\n')
+  }
+  setTimeout(() => { void evaluateAuth() }, 30_000)          // let the gateway settle before the first probe
+  setInterval(() => { void evaluateAuth() }, AUTH_WATCH_MS).unref()
+}
+
 /** Start `claude auth login` on a pty and wait for it to print the authorization URL. */
 async function startLogin(): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
   endLoginSession()
@@ -3470,6 +3623,7 @@ client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
   startWatchdog()
   startPresenceWatcher()
+  startAuthWatch()          // independent of the presence flags — see startAuthWatch
   void syncSlashCommands(c.user.id)
 })
 
@@ -3488,6 +3642,68 @@ if (process.env.DISCORD_USAGE_SELFTEST === '1') {
     firstLine: a.split('\n')[0],
   }, null, 2))
   process.exit(0)
+}
+
+// Self-test for the auth watcher (DISCORD_AUTHWATCH_SELFTEST=1): drives the REAL evaluateAuth over
+// synthetic credential files and prints a verdict per case, then exits. Runs before client.login, so
+// it never touches Discord. Point CLAUDE_CONFIG_DIR at an EMPTY temp dir to use it.
+//
+// The guard below is not ceremony: this block WRITES to CRED_FILE, and against a real config dir that
+// would overwrite live credentials. A real config always has the file; an empty temp dir never does,
+// so refusing when it already exists fails safe in the only direction that matters.
+if (process.env.DISCORD_AUTHWATCH_SELFTEST === '1') {
+  const H = 3_600_000, now = 1_700_000_000_000       // fixed clock: the decision must not depend on wall time
+  const past = { known: true, expiresAt: now - H }, future = { known: true, expiresAt: now + 20 * 24 * H }
+  const absent = { known: false, expiresAt: 0 }
+  const cases: Array<[string, Verdict, Verdict]> = [
+    // label, expected, actual
+    ['refresh expired -> dead, whatever the probe says', 'dead', authVerdict(past, now + H, 'ok', now)],
+    ['refresh expired + probe unknown -> dead',          'dead', authVerdict(past, now + H, 'unknown', now)],
+    ['healthy refresh + probe ok -> alive',              'alive', authVerdict(future, now + H, 'ok', now)],
+    ['CRY-WOLF GUARD: expired access + rejected -> hold', 'hold', authVerdict(absent, now - H, 'rejected', now)],
+    ['live access + rejected -> strike (revoked)',       'strike', authVerdict(absent, now + H, 'rejected', now)],
+    ['live access + rejected, refresh still valid -> strike', 'strike', authVerdict(future, now + H, 'rejected', now)],
+    ['429/5xx (unknown) never kills a healthy bot',      'hold', authVerdict(absent, now + H, 'unknown', now)],
+    ['no creds at all (access null) + rejected -> hold', 'hold', authVerdict(absent, null, 'rejected', now)],
+    ['field absent + probe ok -> alive',                 'alive', authVerdict(absent, now + H, 'ok', now)],
+  ]
+  const failed = cases.filter(([, want, got]) => want !== got)
+
+  // The strike COUNTER is stateful, so exercise it directly: one strike must not kill.
+  setAuthAlive(); authProbeFails = 0
+  const oneStrike = (() => { if (++authProbeFails >= 2) setAuthDead('x'); return authDead })()
+  const twoStrikes = (() => { if (++authProbeFails >= 2) setAuthDead('x'); return authDead })()
+  setAuthAlive(); authProbeFails = 0
+
+  // Presence precedence. This exists because the likeliest failure here is not a wrong decision but
+  // a correct one nothing ever reads — an override that is written and never reached looks identical
+  // to a working one until the day it matters. So: call the real tickPresence and see what it set.
+  writeFileSync(PRESENCE_FILE, '📖 reading something\n')          // pretend the hooks left activity
+  lastPresenceText = null; authDead = true
+  tickPresence()
+  const whenDead = lastPresenceText
+  writeFileSync(PRESENCE_STATUS_FILE, 'auto-dnd: usage 98%')
+  lastPresenceText = null
+  tickPresence()
+  const deadBeatsPin = lastPresenceText
+  authDead = false; lastPresenceText = null
+  tickPresence()
+  const whenPinned = lastPresenceText
+  unlinkSync(PRESENCE_STATUS_FILE); lastPresenceText = null
+  tickPresence()
+  const whenNormal = lastPresenceText
+  const presenceOk = whenDead === AUTH_DEAD_STATUS && deadBeatsPin === AUTH_DEAD_STATUS
+    && whenPinned === 'auto-dnd: usage 98%' && whenNormal !== AUTH_DEAD_STATUS
+
+  const allOk = failed.length === 0 && !oneStrike && twoStrikes && presenceOk
+  process.stderr.write('AUTHWATCH SELFTEST\n' + JSON.stringify({
+    cases: cases.map(([l, want, got]) => ({ case: l, want, got, pass: want === got })),
+    oneStrikeKills: oneStrike, twoStrikesKill: twoStrikes,
+    presence: { whenDead, deadBeatsPin, whenPinned, whenNormal, pass: presenceOk },
+    passed: cases.length - failed.length, of: cases.length,
+    ok: allOk,
+  }, null, 2) + '\n')
+  process.exit(allOk ? 0 : 1)
 }
 
 client.login(TOKEN).catch(err => {
