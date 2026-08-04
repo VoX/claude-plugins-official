@@ -77,6 +77,102 @@ const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const DM_USERS_FILE = join(STATE_DIR, 'dm_users.json')
 
+// --- stderr capture -----------------------------------------------------------------------------
+// This bridge's fd 2 is a SOCKET TO THE MCP CLIENT, not a terminal and not a file. Nothing persists
+// it, so every diagnostic the bridge has ever written -- `watchdog miss N/3`, `gateway connected`,
+// `client error`, `slash command sync error` -- has been unreadable by anyone, on any box.
+//
+// That cost a real outage on 2026-08-04: the watchdog killed the bridge on a stale gateway, the MCP
+// client respawned it, and the pair raced on one bot token until the service was restarted by hand.
+// The mechanism was only recoverable by reading pids out of /proc, because the one line that would
+// have named it went to a socket and vanished.
+//
+// So: mirror every stderr write to a file. A TEE, not a redirect -- the MCP client still gets its
+// copy, because that is a live protocol channel and stealing it would break the transport. Patching
+// the sink rather than the ~40 call sites means anything added later is captured for free.
+const STDERR_LOG = process.env.DISCORD_STDERR_LOG
+if (STDERR_LOG) {
+  try {
+    mkdirSync(dirname(STDERR_LOG), { recursive: true, mode: 0o700 })
+    const original = process.stderr.write.bind(process.stderr)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(process.stderr as any).write = (chunk: any, ...rest: any[]): boolean => {
+      try {
+        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+        appendFileSync(STDERR_LOG, `${new Date().toISOString()} ${text}`, { mode: 0o600 })
+      } catch { /* logging must never break the process it is logging */ }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (original as any)(chunk, ...rest)
+    }
+  } catch (e) {
+    process.stderr.write(`discord channel: cannot init stderr log: ${e} — continuing without it\n`)
+  }
+}
+
+// --- single-bridge guard ------------------------------------------------------------------------
+// Exactly one bridge per state dir. The watchdog below is designed to exit and be replaced, but
+// NOTHING previously stopped the replacement from coming up while the old process still held its
+// gateway -- two websockets on one bot token, both receiving every interaction and racing to answer
+// it. Slash commands fail with "unknown interaction" while ordinary replies mostly still land, which
+// is a confusing shape to debug from outside.
+//
+// The service wrapper already flocks (claude-discord-wrapper.sh), but one layer too high: it stops
+// two claude SESSIONS, not two MCP bridges spawned by one session. This is the missing lock.
+//
+// Advisory flock on a file descriptor held for process lifetime; the kernel releases it on exit, so
+// a crashed bridge never leaves a stale lock behind -- which a pidfile would.
+const BRIDGE_LOCK = join(STATE_DIR, 'bridge.lock')
+try {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  let holderPid = 0
+  try { holderPid = Number.parseInt(readFileSync(BRIDGE_LOCK, 'utf8').trim().split(/\s+/)[0] ?? '', 10) || 0 } catch { /* no lock yet */ }
+  // LIVENESS-CHECKED PIDFILE rather than a bare exclusive create. `kill(pid, 0)` signals nothing and
+  // throws only when the pid is gone, so a bridge killed by the watchdog (or OOM, or SIGKILL) leaves
+  // a lock its successor can reclaim. A plain O_EXCL file would strand the bot after any hard exit,
+  // which trades a rare duplicate for a permanent outage -- much worse than the bug it prevents.
+  if (holderPid && holderPid !== process.pid) {
+    let alive = true
+    try { process.kill(holderPid, 0) } catch { alive = false }
+    if (alive) {
+      process.stderr.write(
+        `discord channel: bridge pid ${holderPid} still alive — refusing to open a second gateway on this token\n`,
+      )
+      process.exit(3)
+    }
+    process.stderr.write(`discord channel: reclaiming bridge lock from dead pid ${holderPid}\n`)
+  }
+  writeFileSync(BRIDGE_LOCK, `${process.pid} ${new Date().toISOString()}\n`, { mode: 0o600 })
+} catch (e) {
+  // A lock we cannot take is not a reason to refuse to run -- an unwritable state dir would take the
+  // bot down entirely, which is worse than the duplicate this guards against.
+  process.stderr.write(`discord channel: bridge lock unavailable (${e}) — continuing unguarded\n`)
+}
+
+// --- watchdog respawn backoff -------------------------------------------------------------------
+// The watchdog exits on a stale gateway and the MCP client respawns us. That is correct once, and a
+// disaster repeated: Discord rate-limits gateway IDENTIFY, so a bridge that comes straight back up
+// gets rate-limited, never reaches READY, and is killed again 90s later. The loop sustains itself
+// and the bot looks wedged while the process churns -- observed 2026-08-04.
+//
+// So a watchdog exit leaves a timestamp, and the next start reads it and waits before connecting.
+// Only the WATCHDOG writes this stamp: a clean restart (deploy, config change, systemctl) never
+// stamps, so a deliberate restart is never delayed. The delay is deliberately longer than Discord's
+// identify window rather than a token pause -- a backoff shorter than the rate limit is just a
+// slower version of the same loop.
+const EXIT_STAMP = join(STATE_DIR, '.watchdog-exit')
+const RESPAWN_BACKOFF_MS = 30_000
+const RESPAWN_WINDOW_MS = 5 * 60_000
+function readBackoffMs(): number {
+  try {
+    const at = Number.parseInt(readFileSync(EXIT_STAMP, 'utf8').trim(), 10)
+    if (!Number.isFinite(at)) return 0
+    const age = Date.now() - at
+    // Outside the window the last watchdog exit is ancient history, not a loop.
+    if (age < 0 || age > RESPAWN_WINDOW_MS) return 0
+    return Math.max(0, RESPAWN_BACKOFF_MS - age)
+  } catch { return 0 }
+}
+
 // Load ~/.claude/channels/discord/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where the token lives.
 try {
@@ -2198,6 +2294,11 @@ function startWatchdog(): void {
     )
     if (watchdogMisses >= WATCHDOG_MAX_MISSES) {
       clearInterval(timer)
+      // Stamp the exit so the REPLACEMENT can back off. Without this the loop is self-sustaining:
+      // Discord rate-limits gateway identifies, so a bridge that respawns instantly never gets a
+      // clean identify, never reaches READY, and is killed again 90s later -- forever. The bot looks
+      // wedged from outside while the process churns. See readBackoffMs.
+      try { writeFileSync(EXIT_STAMP, `${Date.now()}\n`, { mode: 0o600 }) } catch { /* best effort */ }
       terminalExit(`watchdog: ws not ready for ${WATCHDOG_MAX_MISSES} checks`)
     }
   }, WATCHDOG_INTERVAL_MS)
@@ -3655,6 +3756,10 @@ async function syncSlashCommands(appId: string): Promise<void> {
 
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  // A successful connect ends the loop, so clear the stamp. Without this a bridge that backed off,
+  // connected fine, and was then restarted DELIBERATELY inside the window would be delayed again for
+  // no reason -- the backoff would outlive the condition it exists for and read as a slow startup.
+  try { unlinkSync(EXIT_STAMP) } catch { /* absent = nothing to clear */ }
   startWatchdog()
   startPresenceWatcher()
   startAuthWatch()          // independent of the presence flags — see startAuthWatch
@@ -3738,6 +3843,18 @@ if (process.env.DISCORD_AUTHWATCH_SELFTEST === '1') {
     ok: allOk,
   }, null, 2) + '\n')
   process.exit(allOk ? 0 : 1)
+}
+
+// Delay the IDENTIFY if the previous process was watchdog-killed moments ago (see readBackoffMs).
+// Placed at the login call rather than at startup so the MCP transport is already serving: the
+// client can talk to us during the wait instead of seeing an unresponsive server.
+const backoffMs = readBackoffMs()
+if (backoffMs > 0) {
+  process.stderr.write(
+    `discord channel: previous bridge was watchdog-killed ${Math.round((RESPAWN_BACKOFF_MS - backoffMs) / 1000)}s ago — ` +
+    `waiting ${Math.round(backoffMs / 1000)}s before connecting (gateway identify is rate-limited)\n`,
+  )
+  await new Promise(r => setTimeout(r, backoffMs))
 }
 
 client.login(TOKEN).catch(err => {
