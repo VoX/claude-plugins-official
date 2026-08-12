@@ -1658,6 +1658,20 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'lookup',
+      description: 'Resolve a channel or user NAME to its Discord ID. Use when someone refers to a place or person by name ("post that in general", "what\'s barron\'s id") and you need the snowflake to act. Matches case-insensitively on a substring; a leading # or @ is ignored, so "#general" and "general" behave the same. Exact name matches are listed first. Searches every guild the bot is in unless guild_id narrows it. NOTE: finding a channel here does NOT mean the bot may post there — posting is still governed by the access allowlist, and a channel appearing in these results is not permission to use it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Name or part of a name to search for. A leading # or @ is stripped.' },
+          kind: { type: 'string', enum: ['channel', 'user', 'both'], description: 'What to search. Default "both".' },
+          guild_id: { type: 'string', description: 'Restrict the search to one guild (server). Omit to search all guilds the bot is in.' },
+          limit: { type: 'number', description: 'Max rows per kind (default 10, max 50).' },
+        },
+        required: ['query'],
+      },
+    },
+    {
       name: 'react',
       description: 'Add an emoji reaction to a Discord message. Unicode emoji work directly; custom emoji need the <:name:id> form.',
       inputSchema: {
@@ -1930,6 +1944,79 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
             lines.push(`  ${r.chat_id}: FAILED${partial} — ${r.error}`)
           }
         }
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+      case 'lookup': {
+        // Name -> snowflake, for both channels and people.
+        //
+        // PERMISSIONS: the channel half needs NOTHING beyond what the bridge already runs with. The Guilds
+        // intent populates guild.channels.cache at GUILD_CREATE, and Discord only sends channels this bot can
+        // already see -- so the result set is, by construction, "places I could already read about", not a
+        // privilege escalation. No ManageGuild, no privileged intent.
+        //
+        // The people half is deliberately tiered for the same reason. First the caches, which cost nothing:
+        // client.users is populated by every message the bridge has seen, so anyone who has spoken is in there.
+        // Only if that finds nothing does it try guild.members.search(), a REST call that MAY require the
+        // privileged GuildMembers intent depending on the app's config -- and that call is wrapped so a refusal
+        // degrades to "no extra matches" instead of failing the whole lookup. A tool that half-works everywhere
+        // beats one that needs a portal toggle before it works at all.
+        const rawQuery = String(args.query ?? '')
+        const q = rawQuery.replace(/^[#@]/, '').trim().toLowerCase()
+        if (!q) return { content: [{ type: 'text', text: 'lookup: empty query' }], isError: true }
+        const kind = (args.kind as string) || 'both'
+        const limit = Math.max(1, Math.min(50, Number(args.limit) || 10))
+        const guildFilter = args.guild_id ? String(args.guild_id) : null
+        const guilds = [...client.guilds.cache.values()].filter(g => !guildFilter || g.id === guildFilter)
+        if (guildFilter && guilds.length === 0)
+          return { content: [{ type: 'text', text: `lookup: not in guild ${guildFilter}` }], isError: true }
+
+        const lines: string[] = []
+        // Exact name before substring, so "general" doesn't bury #general under #general-2 and #generally.
+        const rank = (name: string) => (name.toLowerCase() === q ? 0 : 1)
+
+        if (kind === 'channel' || kind === 'both') {
+          const hits: { id: string; name: string; type: string; guild: string; guildId: string }[] = []
+          for (const g of guilds)
+            for (const ch of g.channels.cache.values())
+              if (ch?.name && ch.name.toLowerCase().includes(q))
+                hits.push({ id: ch.id, name: ch.name, type: ChannelType[ch.type] ?? String(ch.type), guild: g.name, guildId: g.id })
+          hits.sort((a, b) => rank(a.name) - rank(b.name) || a.name.localeCompare(b.name))
+          hits.slice(0, limit).forEach((h, i) =>
+            lines.push(`channel[${i}] id=${h.id} name=${JSON.stringify(h.name)} type=${h.type} guild=${JSON.stringify(h.guild)} guild_id=${h.guildId}`))
+          if (hits.length > limit) lines.push(`channel: ${hits.length - limit} more match, raise limit to see them`)
+          if (hits.length === 0) lines.push('channel: no matches')
+        }
+
+        if (kind === 'user' || kind === 'both') {
+          const seen = new Map<string, string>()   // id -> row
+          const add = (id: string, username: string, display: string, guild: string) => {
+            if (!seen.has(id)) seen.set(id, `id=${id} username=${JSON.stringify(username)} display=${JSON.stringify(display)} guild=${JSON.stringify(guild)}`)
+          }
+          // free tier: whoever the bridge has already seen
+          for (const g of guilds)
+            for (const m of g.members.cache.values())
+              if (m.user.username.toLowerCase().includes(q) || (m.displayName ?? '').toLowerCase().includes(q))
+                add(m.id, m.user.username, m.displayName, g.name)
+          for (const u of client.users.cache.values())
+            if (u.username.toLowerCase().includes(q) || (u.globalName ?? '').toLowerCase().includes(q))
+              add(u.id, u.username, u.globalName ?? u.username, '(seen in messages)')
+          // paid tier: only if the caches came up empty, and never fatal
+          if (seen.size === 0) {
+            for (const g of guilds) {
+              try {
+                const found = await g.members.search({ query: q, limit })
+                for (const m of found.values()) add(m.id, m.user.username, m.displayName, g.name)
+              } catch (e) {
+                lines.push(`user: guild ${JSON.stringify(g.name)} member search unavailable (${(e as Error).message}) — cached results only`)
+              }
+            }
+          }
+          const rows = [...seen.values()].slice(0, limit)
+          rows.forEach((r, i) => lines.push(`user[${i}] ${r}`))
+          if (seen.size === 0) lines.push('user: no matches')
+          else if (seen.size > limit) lines.push(`user: ${seen.size - limit} more match, raise limit to see them`)
+        }
+
         return { content: [{ type: 'text', text: lines.join('\n') }] }
       }
       case 'get_user_info': {
