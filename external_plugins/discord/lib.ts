@@ -1006,3 +1006,53 @@ export function makeTtlCache<T>(ttlMs: number): TtlCache<T> {
     isFresh(now = Date.now()) { return !!entry && now - entry.at < ttlMs },
   }
 }
+
+// ---- lookup: name -> snowflake ---------------------------------------------------------------------------
+//
+// Pure half of the `lookup` tool, extracted here because the inline version shipped four defects a five-line
+// test would have caught (a reviewer found them within the hour): dead branches from a mis-remembered enum
+// name, a strip-before-trim ordering bug, a fractional `limit` leaking into output, and Discord's own
+// `<#123>` mention syntax -- the most likely real input -- silently missing.
+
+/// <summary>What a raw query normalises to, plus a snowflake if the user pasted a real mention.</summary>
+export type LookupQuery = { text: string; id: string | null }
+
+/**
+ * Normalise a lookup query.
+ *
+ * TRIM FIRST, then strip: `" #general"` has to work, and an anchored `^[#@]` against the untrimmed string
+ * silently does nothing. Then unicode-normalise, because typing `#café` in a client can produce NFC while a
+ * channel name carries NFD and `includes` compares code points, not graphemes.
+ *
+ * `<#123456>` / `<@!123456>` short-circuit to an id: that is what Discord actually puts in message content
+ * when someone types `#general`, so the commonest real input is an exact hit rather than a miss.
+ */
+export function normalizeLookupQuery(raw: unknown): LookupQuery {
+  const s = String(raw ?? '').trim()
+  const mention = s.match(/^<[#@]!?&?(\d{5,25})>$/)
+  if (mention) return { text: '', id: mention[1] }
+  if (/^\d{5,25}$/.test(s)) return { text: '', id: s }   // a bare snowflake is already the answer
+  const stripped = s.replace(/^[#@]+/, '').trim()
+  return { text: stripped.normalize('NFKD').toLowerCase(), id: null }
+}
+
+/** Clamp a caller-supplied limit to a whole number in [1, max]. Fractions reached Discord's REST API as
+ *  `?limit=2.7` and came back as an error the catch then reported as "member search unavailable". */
+export function clampLookupLimit(raw: unknown, fallback = 10, max = 50): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.max(1, Math.min(max, Math.floor(n)))
+}
+
+/** Does a candidate name match the normalised query? Both sides get the same normalisation, or an NFD channel
+ *  name never matches an NFC query. */
+export function lookupNameMatches(name: string | null | undefined, q: string): boolean {
+  if (!name || !q) return false
+  return name.normalize('NFKD').toLowerCase().includes(q)
+}
+
+/** Sort key for a name match: exact (0) before substring (1), then alphabetical.
+ *  Deliberately NOT ranked by channel type -- see the comment on lookupRank in server.ts. */
+export function lookupRank(name: string, q: string): number {
+  return name.normalize('NFKD').toLowerCase() === q ? 0 : 1
+}

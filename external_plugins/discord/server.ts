@@ -54,7 +54,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir, tmpdir } from 'os'
 import { join, sep, dirname } from 'path'
 import sharp from 'sharp'
-import { safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, isWorking, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, specEntryLabel, kindToChannelType, resolveColorInput, grantGroup, removeGroup, makeTtlCache, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type RawGuildState, type SpecDiff, type SpecOverwrite, type OverwriteEdit } from './lib'
+import { normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank, safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, isWorking, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, specEntryLabel, kindToChannelType, resolveColorInput, grantGroup, removeGroup, makeTtlCache, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type RawGuildState, type SpecDiff, type SpecOverwrite, type OverwriteEdit } from './lib'
 
 // Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
 // environment (only our systemd service sets it). Fresh claude CLI sessions
@@ -1659,7 +1659,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'lookup',
-      description: 'Resolve a channel or user NAME to its Discord ID. Use when someone refers to a place or person by name ("post that in general", "what\'s barron\'s id") and you need the snowflake to act. Matches case-insensitively on a substring; a leading # or @ is ignored, so "#general" and "general" behave the same. Exact name matches are listed first. Searches every guild the bot is in unless guild_id narrows it. NOTE: finding a channel here does NOT mean the bot may post there — posting is still governed by the access allowlist, and a channel appearing in these results is not permission to use it.',
+      description: 'Resolve a channel or user NAME to its Discord ID. Use when someone refers to a place or person by name ("post that in general", "what\'s barron\'s id") and you need the snowflake to act. Matches case-insensitively on a substring; a leading # or @ is ignored, so "#general" and "general" behave the same. A pasted mention (<#123>, <@123>) or a bare snowflake resolves directly. Exact name matches are listed first; every row reports the channel type, so check it before sending (a forum channel cannot take a message). Searches every guild the bot is in unless guild_id narrows it. TWO THINGS THIS IS NOT: finding a channel is not permission to post there — the access allowlist still governs that; and results span every guild the bot is in, so they are for YOUR resolution and should not be relayed verbatim to whoever asked — do not read one guild\'s channel or member names out into another.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1950,37 +1950,60 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         // Name -> snowflake, for both channels and people.
         //
         // PERMISSIONS: the channel half needs NOTHING beyond what the bridge already runs with. The Guilds
-        // intent populates guild.channels.cache at GUILD_CREATE, and Discord only sends channels this bot can
-        // already see -- so the result set is, by construction, "places I could already read about", not a
-        // privilege escalation. No ManageGuild, no privileged intent.
+        // intent populates guild.channels.cache at GUILD_CREATE and Discord only sends channels this bot can
+        // already see, so the result set is "places I could already read about" by construction. Verified
+        // live: guilds/{id}/channels and guilds/{id}/members/search both return 200 on the bridge's own token
+        // with no privileged intent.
         //
-        // The people half is deliberately tiered for the same reason. First the caches, which cost nothing:
-        // client.users is populated by every message the bridge has seen, so anyone who has spoken is in there.
-        // Only if that finds nothing does it try guild.members.search(), a REST call that MAY require the
-        // privileged GuildMembers intent depending on the app's config -- and that call is wrapped so a refusal
-        // degrades to "no extra matches" instead of failing the whole lookup. A tool that half-works everywhere
-        // beats one that needs a portal toggle before it works at all.
-        const rawQuery = String(args.query ?? '')
-        const q = rawQuery.replace(/^[#@]/, '').trim().toLowerCase()
-        if (!q) return { content: [{ type: 'text', text: 'lookup: empty query' }], isError: true }
-        const kind = (args.kind as string) || 'both'
-        const limit = Math.max(1, Math.min(50, Number(args.limit) || 10))
-        const guildFilter = args.guild_id ? String(args.guild_id) : null
+        // ORDERING IS BY NAME ONLY, never by channel type. An earlier version ranked "postable" types first,
+        // reasoning that you look a channel up in order to post in it. Both halves of that were wrong:
+        // BaseGuildVoiceChannel carries the text mixin so voice channels ARE sendable in v14, and the branch
+        // list was written against remembered enum names -- ChannelType[5] is "GuildNews", not
+        // "GuildAnnouncement", and [11] is "GuildPublicThread", not "PublicThread", so three of five branches
+        // were unreachable. The one exotic type that did match, GuildForum, is the single type that genuinely
+        // cannot take a message, so the sort promoted exactly the id a reply would fail on. Type is reported
+        // in every row; let the caller read it.
+        const parsed = normalizeLookupQuery(args.query)
+        const limit = clampLookupLimit(args.limit)
+        const kind = (args.kind as string) ?? 'both'
+        if (kind !== 'channel' && kind !== 'user' && kind !== 'both')
+          return { content: [{ type: 'text', text: `lookup: kind must be channel|user|both, got ${JSON.stringify(kind)}` }], isError: true }
+        // An explicitly-passed-but-empty guild_id must NOT fail open into an all-guild search: this tool
+        // spans every guild the bot is in, so failing open widens the blast radius of a caller's mistake.
+        const hasGuildArg = args.guild_id !== undefined && args.guild_id !== null
+        const guildFilter = hasGuildArg ? String(args.guild_id).trim() : null
+        if (hasGuildArg && !guildFilter)
+          return { content: [{ type: 'text', text: 'lookup: guild_id was passed but empty' }], isError: true }
         const guilds = [...client.guilds.cache.values()].filter(g => !guildFilter || g.id === guildFilter)
         if (guildFilter && guilds.length === 0)
           return { content: [{ type: 'text', text: `lookup: not in guild ${guildFilter}` }], isError: true }
 
         const lines: string[] = []
-        // Exact name before substring, so "general" doesn't bury #general under #general-2 and #generally.
-        const rank = (name: string) => (name.toLowerCase() === q ? 0 : 1)
+
+        // A pasted <#id> / <@id> mention, or a bare snowflake, is already the answer -- resolve it directly
+        // instead of substring-searching for a number that appears in no name.
+        if (parsed.id) {
+          const ch = client.channels.cache.get(parsed.id)
+          if (ch) {
+            const g = (ch as { guild?: { name: string; id: string } }).guild
+            lines.push(`channel[0] id=${ch.id} name=${JSON.stringify((ch as { name?: string }).name ?? '(dm)')} type=${ChannelType[ch.type] ?? String(ch.type)}${g ? ` guild=${JSON.stringify(g.name)} guild_id=${g.id}` : ''}`)
+          }
+          const u = client.users.cache.get(parsed.id)
+          if (u) lines.push(`user[0] id=${u.id} username=${JSON.stringify(u.username)} display=${JSON.stringify(u.globalName ?? u.username)}`)
+          if (lines.length === 0) lines.push(`id ${parsed.id} is not a channel or user this bot can see`)
+          return { content: [{ type: 'text', text: lines.join('\n') }] }
+        }
+
+        const q = parsed.text
+        if (!q) return { content: [{ type: 'text', text: 'lookup: empty query' }], isError: true }
 
         if (kind === 'channel' || kind === 'both') {
           const hits: { id: string; name: string; type: string; guild: string; guildId: string }[] = []
           for (const g of guilds)
             for (const ch of g.channels.cache.values())
-              if (ch?.name && ch.name.toLowerCase().includes(q))
+              if (lookupNameMatches(ch?.name, q))
                 hits.push({ id: ch.id, name: ch.name, type: ChannelType[ch.type] ?? String(ch.type), guild: g.name, guildId: g.id })
-          hits.sort((a, b) => rank(a.name) - rank(b.name) || a.name.localeCompare(b.name))
+          hits.sort((a, b) => lookupRank(a.name, q) - lookupRank(b.name, q) || a.name.localeCompare(b.name))
           hits.slice(0, limit).forEach((h, i) =>
             lines.push(`channel[${i}] id=${h.id} name=${JSON.stringify(h.name)} type=${h.type} guild=${JSON.stringify(h.guild)} guild_id=${h.guildId}`))
           if (hits.length > limit) lines.push(`channel: ${hits.length - limit} more match, raise limit to see them`)
@@ -1988,33 +2011,49 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         }
 
         if (kind === 'user' || kind === 'both') {
-          const seen = new Map<string, string>()   // id -> row
+          // guild -> row, so someone in three guilds reports all three instead of whichever was iterated
+          // first. A single-guild row reads authoritative and can feed a wrong guild_id into a follow-up.
+          const seen = new Map<string, { username: string; display: string; guilds: Set<string> }>()
           const add = (id: string, username: string, display: string, guild: string) => {
-            if (!seen.has(id)) seen.set(id, `id=${id} username=${JSON.stringify(username)} display=${JSON.stringify(display)} guild=${JSON.stringify(guild)}`)
+            const row = seen.get(id) ?? { username, display, guilds: new Set<string>() }
+            row.guilds.add(guild)
+            seen.set(id, row)
           }
-          // free tier: whoever the bridge has already seen
           for (const g of guilds)
             for (const m of g.members.cache.values())
-              if (m.user.username.toLowerCase().includes(q) || (m.displayName ?? '').toLowerCase().includes(q))
+              if (lookupNameMatches(m.user.username, q) || lookupNameMatches(m.displayName, q))
                 add(m.id, m.user.username, m.displayName, g.name)
-          for (const u of client.users.cache.values())
-            if (u.username.toLowerCase().includes(q) || (u.globalName ?? '').toLowerCase().includes(q))
-              add(u.id, u.username, u.globalName ?? u.username, '(seen in messages)')
-          // paid tier: only if the caches came up empty, and never fatal
-          if (seen.size === 0) {
-            for (const g of guilds) {
-              try {
-                const found = await g.members.search({ query: q, limit })
-                for (const m of found.values()) add(m.id, m.user.username, m.displayName, g.name)
-              } catch (e) {
-                lines.push(`user: guild ${JSON.stringify(g.name)} member search unavailable (${(e as Error).message}) — cached results only`)
-              }
+          // The global user cache is NOT guild-scoped, so it is only consulted on an unfiltered search --
+          // otherwise `guild_id` silently fails to narrow and a caller asking about one guild learns about
+          // people from another. (Found in review: it did exactly that.)
+          if (!guildFilter)
+            for (const u of client.users.cache.values())
+              if (lookupNameMatches(u.username, q) || lookupNameMatches(u.globalName, q))
+                add(u.id, u.username, u.globalName ?? u.username, '(seen in messages)')
+
+          // REST fallback, PER GUILD rather than gated on the global result set: one junk substring hit
+          // anywhere used to suppress the authoritative search everywhere, and since members.search caches
+          // what it finds, a single stray match could poison the gate permanently. Run in parallel -- serial
+          // awaits stacked a round-trip per guild on every typo. NOTE the endpoint is PREFIX-only, so it
+          // finds "barronn85" from "barr" but never from "arron"; the cache half is what covers substrings.
+          const needSearch = guilds.filter(g => ![...seen.values()].some(r => r.guilds.has(g.name)))
+          const searchErrors: string[] = []
+          if (needSearch.length > 0) {
+            const results = await Promise.allSettled(
+              needSearch.map(async g => ({ g, found: await g.members.search({ query: q, limit }) })),
+            )
+            for (let i = 0; i < results.length; i++) {
+              const r = results[i]
+              if (r.status === 'fulfilled') for (const m of r.value.found.values()) add(m.id, m.user.username, m.displayName, r.value.g.name)
+              else searchErrors.push(`user: guild ${JSON.stringify(needSearch[i].name)} member search unavailable (${(r.reason as Error)?.message ?? r.reason}) -- cached results only`)
             }
           }
-          const rows = [...seen.values()].slice(0, limit)
-          rows.forEach((r, i) => lines.push(`user[${i}] ${r}`))
+          const rows = [...seen.entries()].slice(0, limit)
+          rows.forEach(([id, r], i) =>
+            lines.push(`user[${i}] id=${id} username=${JSON.stringify(r.username)} display=${JSON.stringify(r.display)} guilds=${JSON.stringify([...r.guilds].sort().join(', '))}`))
           if (seen.size === 0) lines.push('user: no matches')
           else if (seen.size > limit) lines.push(`user: ${seen.size - limit} more match, raise limit to see them`)
+          lines.push(...searchErrors)   // qualifiers AFTER the rows they qualify, not before
         }
 
         return { content: [{ type: 'text', text: lines.join('\n') }] }

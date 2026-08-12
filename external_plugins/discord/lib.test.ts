@@ -3,6 +3,7 @@ import {
   safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, composePresence, withContextPrefix,
   resolveColorInput, validatePermissionNames, kindToChannelType, channelTypeToKind,
   buildServerSpec, computeSpecDiff, renderSpecDiff, overwriteEditMap, grantGroup, removeGroup, makeTtlCache,
+  normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank,
   type RawGuildState, type ServerSpec,
 } from './lib'
 
@@ -877,5 +878,69 @@ describe('makeTtlCache (used by /usage now that it is open to everyone)', () => 
     expect(c.isFresh(61_001)).toBe(false)
     c.clear()
     expect(c.isFresh(30_000)).toBe(false)
+  })
+})
+
+describe('lookup query normalisation (every case here is a defect review found in the inline version)', () => {
+  test('a Discord mention short-circuits to its id -- the commonest real input', () => {
+    // Typing "#general" in a client sends the literal "<#123>", which used to return "no matches".
+    expect(normalizeLookupQuery('<#1492558787561914542>')).toEqual({ text: '', id: '1492558787561914542' })
+    expect(normalizeLookupQuery('<@!409669317299535903>')).toEqual({ text: '', id: '409669317299535903' })
+    expect(normalizeLookupQuery('<@&1486191604183334964>')).toEqual({ text: '', id: '1486191604183334964' })
+  })
+
+  test('a bare snowflake is already the answer', () => {
+    expect(normalizeLookupQuery('1492558787561914542').id).toBe('1492558787561914542')
+  })
+
+  test('TRIM runs before the #/@ strip', () => {
+    // The bug: /^[#@]/ anchored against an untrimmed string does nothing, so " #general" searched for
+    // "#general" literally and missed.
+    expect(normalizeLookupQuery(' #general').text).toBe('general')
+    expect(normalizeLookupQuery('  @barron  ').text).toBe('barron')
+    expect(normalizeLookupQuery('##general').text).toBe('general')
+  })
+
+  test('junk types degrade to a harmless empty query rather than throwing', () => {
+    for (const junk of [null, undefined, 42, {}, [], '#', '@', '   ']) {
+      const r = normalizeLookupQuery(junk as unknown)
+      expect(typeof r.text).toBe('string')
+    }
+    expect(normalizeLookupQuery('#').text).toBe('')
+  })
+
+  test('unicode is normalised on BOTH sides, so NFD and NFC agree', () => {
+    const nfd = 'caf\u0065\u0301'   // cafe + combining acute
+    const nfc = 'caf\u00e9'          // precomposed
+    expect(lookupNameMatches(nfd, normalizeLookupQuery(nfc).text)).toBe(true)
+    expect(lookupNameMatches(nfc, normalizeLookupQuery(nfd).text)).toBe(true)
+  })
+
+  test('the query is a substring, never a regex', () => {
+    expect(lookupNameMatches('general', normalizeLookupQuery('.*').text)).toBe(false)
+    expect(lookupNameMatches('a.b', normalizeLookupQuery('a.b').text)).toBe(true)
+  })
+
+  test('limit is clamped to a WHOLE number in range', () => {
+    // 2.7 survived the old clamp and reached Discord as ?limit=2.7, which it rejects -- surfaced to the
+    // caller as a misleading "member search unavailable".
+    expect(clampLookupLimit(2.7)).toBe(2)
+    expect(clampLookupLimit(999)).toBe(50)
+    expect(clampLookupLimit(0)).toBe(10)
+    expect(clampLookupLimit(-5)).toBe(10)
+    // Infinity is junk, not "give me the max" -- it falls back like 'abc' and -5 do. The old inline
+    // clamp returned 50 here via Math.min; treating all junk the same way is the more defensible rule.
+    expect(clampLookupLimit(Infinity)).toBe(10)
+    expect(clampLookupLimit('abc')).toBe(10)
+    expect(clampLookupLimit(undefined)).toBe(10)
+  })
+
+  test('exact names rank above substring matches', () => {
+    const q = normalizeLookupQuery('rust').text
+    expect(lookupRank('rust', q)).toBe(0)
+    expect(lookupRank('rustbot', q)).toBe(1)
+    const names = ['rustbot', 'rust', 'trusty']
+    names.sort((a, b) => lookupRank(a, q) - lookupRank(b, q) || a.localeCompare(b))
+    expect(names[0]).toBe('rust')
   })
 })
