@@ -971,6 +971,35 @@ export function removeGroup(groups: Record<string, GroupPolicyLike>, channelId: 
   return true
 }
 
+// ── DM access (the TOP-LEVEL allowFrom: who may DM the bot) ──
+// Distinct from each channel's own allowFrom above, which filters senders WITHIN a granted channel.
+// Same field name, different scope. Pure helpers so the owner-gated /access handler stays a thin
+// wrapper and this logic is testable, exactly like grantGroup/removeGroup.
+
+// Returns false when they already had access (nothing changed). Also clears any pending pairing
+// code for them: they are authorised now, so the code is dead weight and would otherwise occupy
+// one of the three pending slots until it expired an hour later.
+export function grantDm(
+  allowFrom: string[],
+  pending: Record<string, { senderId: string }>,
+  userId: string,
+): boolean {
+  if (allowFrom.includes(userId)) return false
+  allowFrom.push(userId)
+  for (const [code, p] of Object.entries(pending)) {
+    if (p.senderId === userId) delete pending[code]
+  }
+  return true
+}
+
+// Returns false when they didn't have access (nothing to remove).
+export function removeDm(allowFrom: string[], userId: string): boolean {
+  const i = allowFrom.indexOf(userId)
+  if (i < 0) return false
+  allowFrom.splice(i, 1)
+  return true
+}
+
 
 // ── TTL cache with in-flight de-duplication ──
 // Used by /usage: the command is now open to every user, so a busy channel could hammer the

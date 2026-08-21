@@ -54,7 +54,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir, tmpdir } from 'os'
 import { join, sep, dirname } from 'path'
 import sharp from 'sharp'
-import { normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank, safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, isWorking, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, specEntryLabel, kindToChannelType, resolveColorInput, grantGroup, removeGroup, makeTtlCache, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type RawGuildState, type SpecDiff, type SpecOverwrite, type OverwriteEdit } from './lib'
+import { normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank, safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, isWorking, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, specEntryLabel, kindToChannelType, resolveColorInput, grantGroup, removeGroup, grantDm, removeDm, makeTtlCache, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type RawGuildState, type SpecDiff, type SpecOverwrite, type OverwriteEdit } from './lib'
 
 // Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
 // environment (only our systemd service sets it). Fresh claude CLI sessions
@@ -2717,6 +2717,26 @@ function usageResetIn(iso: unknown): string {
   return `${h}h${String(m).padStart(2, '0')}m`
 }
 
+// ISO-8601 timestamp -> absolute ET date, "Thu, Aug 20, 4:00 PM EDT". Shown only for the WEEKLY
+// windows (7d family + fable), where "resets in 3d8h" tells you the distance but not the day you can
+// plan around; the 5h window keeps the relative form, which is the useful one at that scale.
+//
+// Rendered in US Eastern, not the box's UTC: every user of these bots is ET, and near midnight the
+// two disagree on the DAY (2026-08-17T00:00Z is Sunday the 16th in ET) — a date that names the wrong
+// day is worse than no date. timeZoneName rather than a hardcoded "ET" so it self-corrects across
+// the DST boundary (EDT in August, EST in January) instead of quietly drifting an hour in winter.
+const RESET_DATE_FMT = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  weekday: 'short', month: 'short', day: 'numeric',
+  hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+})
+function usageResetDate(iso: unknown): string {
+  if (typeof iso !== 'string' || !iso) return ''
+  const t = Date.parse(iso)
+  if (Number.isNaN(t)) return ''
+  return RESET_DATE_FMT.format(new Date(t))
+}
+
 // /usage — fetch the OAuth usage endpoint and format a compact report.
 // Mirrors summarizeViaHaiku's credential handling (CRED_FILE -> claudeAiOauth +
 // Bearer token + anthropic-beta). Self-contained so every bot sharing this
@@ -2797,7 +2817,9 @@ function renderUsage(data: Record<string, any>): string {
     any = true
     const pct = Math.round(Number(b.utilization ?? 0))
     const resets = usageResetIn(b.resets_at)
-    lines.push(`• ${label}: ${pct}%${resets ? ` · resets in ${resets}` : ''}`)
+    // Absolute date on the weekly windows only — see usageResetDate.
+    const on = apiKey === 'five_hour' ? '' : usageResetDate(b.resets_at)
+    lines.push(`• ${label}: ${pct}%${resets ? ` · resets in ${resets}` : ''}${on ? ` (${on})` : ''}`)
   }
   // Fable is a per-MODEL SCOPED weekly limit — it has no top-level bucket; it rides data.limits[] with
   // scope.model.display_name == "Fable" (and .percent, not .utilization). Surface it alongside the buckets.
@@ -2808,7 +2830,8 @@ function renderUsage(data: Record<string, any>): string {
     any = true
     const pct = Math.round(Number(fable.percent ?? 0))
     const resets = usageResetIn(fable.resets_at)
-    lines.push(`• 7d fable: ${pct}%${resets ? ` · resets in ${resets}` : ''}`)
+    const on = usageResetDate(fable.resets_at)
+    lines.push(`• 7d fable: ${pct}%${resets ? ` · resets in ${resets}` : ''}${on ? ` (${on})` : ''}`)
   }
   if (!any) lines.push('• (no usage windows returned)')
 
@@ -3469,6 +3492,12 @@ client.on('interactionCreate', async (interaction: Interaction) => {
             : `channels:\n${groups.map(([cid, g]) =>
                 `• <#${cid}> (${cid}) — requireMention: ${g.requireMention ?? true}${(g.allowFrom ?? []).length > 0 ? `, allowFrom: ${g.allowFrom.join(', ')}` : ''}`,
               ).join('\n')}`,
+          // The TOP-LEVEL allowFrom (who may DM the bot) -- distinct from each channel's own
+          // allowFrom printed above, which is a per-channel sender filter. Same field name, different
+          // scope, and conflating them is exactly why this list used to look like it covered DMs.
+          access.allowFrom.length === 0
+            ? 'dm access: (none)'
+            : `dm access:\n${access.allowFrom.map((uid) => `• <@${uid}> (${uid})`).join('\n')}`,
         ]
         await interaction.reply({ content: safeSlice(lines.join('\n'), 1900), flags: MessageFlags.Ephemeral }).catch(() => {})
         return
@@ -3482,6 +3511,47 @@ client.on('interactionCreate', async (interaction: Interaction) => {
           content: 'access is read-only in static mode (DISCORD_ACCESS_MODE=static) — edit access.json and restart.',
           flags: MessageFlags.Ephemeral,
         }).catch(() => {})
+        return
+      }
+
+      // DM ACCESS (owner asked for this 2026-08-21: "allow me to authorize dm conversations too, this is
+      // ok since its a deterministic action that only I can do"). It IS deterministic and it IS owner-gated
+      // -- the check above is interaction.user.id === DISCORD_OWNER_ID, fail-closed with no owner set, so
+      // this is not reachable by anyone else even with server admin.
+      //
+      // Kept as an explicit `user` option rather than a separate subcommand so the owner gate, the static-mode
+      // guard and the access lock below are shared rather than duplicated -- a second copy of this gate is a
+      // second place for it to drift.
+      //
+      // NOTE this only authorises INBOUND DMs. The bot still cannot open a DM with someone who has never
+      // messaged it: there is no createDM anywhere in this plugin, so a DM channel has to exist first.
+      const targetUser = interaction.options.getUser('user')
+      if (targetUser) {
+        if (action === 'grant') {
+          const added = await withAccessLock(() => {
+            const access = loadAccess()
+            const ok = grantDm(access.allowFrom, access.pending, targetUser.id)
+            if (ok) saveAccess(access)
+            return ok
+          })
+          await interaction.reply({
+            content: added
+              ? `✅ <@${targetUser.id}> can now DM me (${targetUser.id})\n⚠️ they must message me first — I can't open a DM channel.`
+              : `<@${targetUser.id}> already had DM access — nothing changed`,
+            flags: MessageFlags.Ephemeral,
+          }).catch(() => {})
+        } else if (action === 'remove') {
+          const removed = await withAccessLock(() => {
+            const access = loadAccess()
+            const ok = removeDm(access.allowFrom, targetUser.id)
+            if (ok) saveAccess(access)
+            return ok
+          })
+          await interaction.reply({
+            content: removed ? `🚫 <@${targetUser.id}> can no longer DM me` : `<@${targetUser.id}> didn't have DM access — nothing to remove`,
+            flags: MessageFlags.Ephemeral,
+          }).catch(() => {})
+        }
         return
       }
 
@@ -3809,7 +3879,7 @@ const SLASH_COMMANDS = [
   // default_member_permissions "0" hides /access from everyone but server
   // admins in the Discord UI; the handler still enforces the real gate
   // (DISCORD_OWNER_ID) — UI visibility is not authorization.
-  { name: 'access',  description: 'Owner-only: manage which channels this bot listens in', type: 1,
+  { name: 'access',  description: 'Owner-only: manage which channels + users this bot listens to', type: 1,
     default_member_permissions: '0', dm_permission: false,
     options: [
       { type: 3, name: 'action', description: 'What to do', required: true,
@@ -3820,6 +3890,7 @@ const SLASH_COMMANDS = [
         ] },
       { type: 7, name: 'channel', description: 'Target channel (defaults to the current channel)', required: false },
       { type: 5, name: 'mentions_only', description: 'Only respond when @mentioned (default true)', required: false },
+      { type: 6, name: 'user', description: 'Target USER — grant/remove their DM access instead of a channel', required: false },
     ] },
   // /login — owner-only re-authentication, so a logged-out bot can be recovered without SSH.
   // This works BECAUSE being logged out does not kill the bot: claude keeps running, this MCP
@@ -3891,6 +3962,45 @@ client.once('ready', c => {
   startAuthWatch()          // independent of the presence flags — see startAuthWatch
   void syncSlashCommands(c.user.id)
 })
+
+// Self-test for the /usage RENDERING (DISCORD_USAGE_RENDER_SELFTEST=1): drives the REAL renderUsage
+// over a synthetic payload and checks the reset dates, then exits. No network and no Discord, so it
+// runs anywhere — the network half is covered separately by DISCORD_USAGE_SELFTEST below.
+//
+// The expected strings are TYPED OUT, not recomputed with the same Intl call renderUsage uses. A test
+// that formats its own expectation agrees with production by construction and would still pass with
+// the timezone dropped, which is the one mistake worth catching here.
+if (process.env.DISCORD_USAGE_RENDER_SELFTEST === '1') {
+  const out = renderUsage({
+    __plan: 'max_20x',
+    five_hour:  { utilization: 12, resets_at: '2026-08-20T20:00:00Z' },
+    seven_day:  { utilization: 45.3, resets_at: '2026-08-20T20:00:00Z' },
+    seven_day_opus: { utilization: 7, resets_at: 'not-a-date' },
+    limits: [{ scope: { model: { display_name: 'Fable' } }, percent: 61, resets_at: '2026-01-14T05:30:00Z' }],
+  })
+  // Midnight UTC is the PREVIOUS day in Eastern. This case is the whole reason the formatter pins a
+  // timeZone: drop it and the line below says "Mon, Aug 17", naming a day the reset does not land on.
+  const edge = renderUsage({ seven_day: { utilization: 1, resets_at: '2026-08-17T00:00:00Z' } })
+  const line = (s: string, p: string) => s.split('\n').find(l => l.startsWith(p)) ?? ''
+  const cases: Array<[string, boolean]> = [
+    ['7d carries the absolute date',      line(out, '• 7d:').includes('(Thu, Aug 20, 4:00 PM EDT)')],
+    ['...and still the relative form',    /resets in \d/.test(line(out, '• 7d:'))],
+    ['fable carries it too',              line(out, '• 7d fable:').includes('(Wed, Jan 14, 12:30 AM EST)')],
+    ['...in EST, so DST is not baked in', !line(out, '• 7d fable:').includes('EDT')],
+    ['5h stays relative-only',            !line(out, '• 5h:').includes('(')],
+    ['an unparseable date is omitted',    line(out, '• 7d opus:') !== '' && !line(out, '• 7d opus:').includes('(')],
+    ['the date is EASTERN, not UTC',      line(edge, '• 7d:').includes('(Sun, Aug 16,')],
+  ]
+  const failed = cases.filter(([, ok]) => !ok)
+  process.stderr.write('USAGE RENDER SELFTEST\n' + JSON.stringify({
+    rendered: out.split('\n'),
+    dayBoundary: line(edge, '• 7d:'),
+    cases: cases.map(([label, ok]) => ({ case: label, pass: ok })),
+    passed: cases.length - failed.length, of: cases.length,
+    ok: failed.length === 0,
+  }, null, 2) + '\n')
+  process.exit(failed.length === 0 ? 0 : 1)
+}
 
 // Self-test for the /usage path (DISCORD_USAGE_SELFTEST=1): exercises the REAL buildUsageReply +
 // usageCache twice and reports whether the second call was served from cache, then exits. Lets the

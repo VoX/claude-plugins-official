@@ -4,8 +4,8 @@ import {
   resolveColorInput, validatePermissionNames, kindToChannelType, channelTypeToKind,
   buildServerSpec, computeSpecDiff, renderSpecDiff, overwriteEditMap, grantGroup, removeGroup, makeTtlCache,
   normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank,
-  type RawGuildState, type ServerSpec,
-} from './lib'
+  grantDm, removeDm,
+  type RawGuildState, type ServerSpec } from './lib'
 
 describe('safeSlice', () => {
   test('returns input unchanged when shorter than limit', () => {
@@ -942,5 +942,51 @@ describe('lookup query normalisation (every case here is a defect review found i
     const names = ['rustbot', 'rust', 'trusty']
     names.sort((a, b) => lookupRank(a, q) - lookupRank(b, q) || a.localeCompare(b))
     expect(names[0]).toBe('rust')
+  })
+})
+
+// ── DM access (/access user:@someone) ──
+// The owner asked for /access to authorise DM conversations as well as channels (2026-08-21). The
+// handler is owner-gated in server.ts; what is testable is the state transition, so that is what these
+// pin. Mirrors the grantGroup/removeGroup tests above.
+describe('grantDm / removeDm', () => {
+  test('grant adds the user to allowFrom', () => {
+    const allow: string[] = []
+    expect(grantDm(allow, {}, '42')).toBe(true)
+    expect(allow).toEqual(['42'])
+  })
+
+  test('re-granting is a no-op and reports it, rather than duplicating', () => {
+    const allow = ['42']
+    expect(grantDm(allow, {}, '42')).toBe(false)
+    expect(allow).toEqual(['42'])   // not ['42','42'] -- a dupe would survive one remove
+  })
+
+  test('granting CLEARS that user pending pairing code, but leaves other people alone', () => {
+    const allow: string[] = []
+    const pending = { aaa: { senderId: '42' }, bbb: { senderId: '99' } }
+    grantDm(allow, pending, '42')
+    expect(pending).toEqual({ bbb: { senderId: '99' } })
+  })
+
+  test('remove takes them back out', () => {
+    const allow = ['42', '43']
+    expect(removeDm(allow, '42')).toBe(true)
+    expect(allow).toEqual(['43'])
+  })
+
+  test('removing someone who never had access reports false and changes nothing', () => {
+    const allow = ['43']
+    expect(removeDm(allow, '42')).toBe(false)
+    expect(allow).toEqual(['43'])
+  })
+
+  test('grant then remove is a round trip -- no residue in allowFrom or pending', () => {
+    const allow: string[] = []
+    const pending = { aaa: { senderId: '42' } }
+    grantDm(allow, pending, '42')
+    removeDm(allow, '42')
+    expect(allow).toEqual([])
+    expect(pending).toEqual({})   // the code stays cleared; revoking access does not resurrect it
   })
 })
