@@ -4,7 +4,7 @@ import {
   resolveColorInput, validatePermissionNames, kindToChannelType, channelTypeToKind,
   buildServerSpec, computeSpecDiff, renderSpecDiff, overwriteEditMap, grantGroup, removeGroup, makeTtlCache,
   normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank,
-  grantDm, removeDm,
+  grantDm, removeDm, resolveById,
   type RawGuildState, type ServerSpec } from './lib'
 
 describe('safeSlice', () => {
@@ -988,5 +988,72 @@ describe('grantDm / removeDm', () => {
     removeDm(allow, '42')
     expect(allow).toEqual([])
     expect(pending).toEqual({})   // the code stays cleared; revoking access does not resurrect it
+  })
+})
+
+// ── resolveById ──
+// The bug: lookup read users.cache and stopped. A member who had never spoken was not in it, so a real
+// user in a guild the bot is in reported as "not a user this bot can see" — a claim about Discord derived
+// from local memory. I believed that line and told the owner twice that he and his brother shared no
+// server with me. He posted once and the same lookup resolved instantly.
+//
+// The FIRST fix then reintroduced the same bug one layer down by catching every throw and calling it
+// "does not exist" — so the error/absence split below is the point, not a detail.
+describe('resolveById', () => {
+  const hit = { id: '1', username: 'cached' }
+  const fetched = { id: '2', username: 'fetched' }
+  const apiErr = (code: number, status: number, message: string) => Object.assign(new Error(message), { code, status })
+
+  test('a cache hit is used and the API is NOT called', async () => {
+    let fetches = 0
+    const r = await resolveById(() => hit, async () => { fetches++; return fetched }, '1')
+    expect(r).toEqual({ user: hit, source: 'cache' })
+    expect(fetches).toBe(0)   // the cache stays the fast path; this must not add a round-trip per lookup
+  })
+
+  test('a cache MISS falls back to the API — the original bug', async () => {
+    const r = await resolveById(() => undefined, async () => fetched, '2')
+    expect(r).toEqual({ user: fetched, source: 'fetch' })
+  })
+
+  test('the id is threaded through to BOTH stubs, not dropped', async () => {
+    // The signature puts `id` last, which is easy to mis-wire; every stub ignoring its argument would
+    // let an implementation calling fetchOne(undefined) pass every other test in this block.
+    let sawCache: string | undefined, sawFetch: string | undefined
+    await resolveById((id) => { sawCache = id; return undefined }, async (id) => { sawFetch = id; return fetched }, '424242')
+    expect(sawCache).toBe('424242')
+    expect(sawFetch).toBe('424242')
+  })
+
+  test('10013 Unknown User is an honest negative', async () => {
+    const r = await resolveById(() => undefined, async () => { throw apiErr(10013, 404, 'Unknown User') }, '9')
+    expect(r).toEqual({ user: undefined, source: 'none' })
+  })
+
+  test('a 404 with no code is also a negative', async () => {
+    const r = await resolveById(() => undefined, async () => { throw Object.assign(new Error('Not Found'), { status: 404 }) }, '9')
+    expect(r.source).toBe('none')
+  })
+
+  test('a 500 is NOT a negative — it is an error, and must not claim nonexistence', async () => {
+    // The regression test for the first fix's defect: this returned source:'none' and the caller
+    // printed "no user with that id exists" off a server error.
+    const r = await resolveById(() => undefined, async () => { throw apiErr(0, 500, 'Internal Server Error') }, '9')
+    expect(r.source).toBe('error')
+    expect(r.error).toContain('Internal Server Error')
+  })
+
+  test('a network stall / abort is an error, not a negative', async () => {
+    const r = await resolveById(() => undefined, async () => { throw new Error('The operation was aborted') }, '9')
+    expect(r.source).toBe('error')
+  })
+
+  test('a 401 (dead token) is an error — every lookup must not start asserting nonexistence', async () => {
+    const r = await resolveById(() => undefined, async () => { throw apiErr(0, 401, 'Unauthorized') }, '9')
+    expect(r.source).toBe('error')
+  })
+
+  test('never rejects — lookup has to answer', async () => {
+    await expect(resolveById(() => undefined, async () => { throw new Error('boom') }, '9')).resolves.toBeDefined()
   })
 })

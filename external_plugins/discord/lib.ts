@@ -992,6 +992,39 @@ export function grantDm(
   return true
 }
 
+// ── lookup by id: cache first, then the API ──
+// users.cache / channels.cache hold only what discord.js has already observed, so a cache miss says
+// nothing about whether the thing exists. Ask the API on a miss.
+//
+// AN ERROR IS NOT A NEGATIVE. The first version of this caught every throw and reported "does not
+// exist", which is the SAME bug it was written to fix, one layer down: a 500, a timeout, an expired
+// token or an exhausted 429 would all have produced a confident claim about Discord derived from a
+// local failure. @discordjs/rest throws DiscordAPIError (carrying .code) for 4xx and HTTPError for 5xx,
+// with retries:3 / timeout:15000 -- so a network stall asserts nonexistence only after ~60s of trying.
+// Only 10013 Unknown User / 404 means it truly is not there; everything else is "I could not find out",
+// and the caller must be able to tell those apart.
+export type ResolveResult<T> =
+  | { user: T; source: 'cache' | 'fetch'; error?: undefined }
+  | { user: undefined; source: 'none'; error?: undefined }
+  | { user: undefined; source: 'error'; error: string }
+
+export async function resolveById<T>(
+  cacheGet: (id: string) => T | undefined,
+  fetchOne: (id: string) => Promise<T>,
+  id: string,
+): Promise<ResolveResult<T>> {
+  const cached = cacheGet(id)
+  if (cached !== undefined) return { user: cached, source: 'cache' }
+  try {
+    return { user: await fetchOne(id), source: 'fetch' }
+  } catch (e) {
+    const err = e as { code?: unknown; status?: unknown; message?: unknown }
+    const missing = err?.code === 10013 || err?.status === 404
+    if (missing) return { user: undefined, source: 'none' }
+    return { user: undefined, source: 'error', error: String(err?.message ?? e) }
+  }
+}
+
 // Returns false when they didn't have access (nothing to remove).
 export function removeDm(allowFrom: string[], userId: string): boolean {
   const i = allowFrom.indexOf(userId)

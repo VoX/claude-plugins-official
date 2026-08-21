@@ -54,7 +54,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir, tmpdir } from 'os'
 import { join, sep, dirname } from 'path'
 import sharp from 'sharp'
-import { normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank, safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, isWorking, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, specEntryLabel, kindToChannelType, resolveColorInput, grantGroup, removeGroup, grantDm, removeDm, makeTtlCache, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type RawGuildState, type SpecDiff, type SpecOverwrite, type OverwriteEdit } from './lib'
+import { normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank, safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, isWorking, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, specEntryLabel, kindToChannelType, resolveColorInput, grantGroup, removeGroup, grantDm, removeDm, resolveById, makeTtlCache, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type RawGuildState, type SpecDiff, type SpecOverwrite, type OverwriteEdit } from './lib'
 
 // Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
 // environment (only our systemd service sets it). Fresh claude CLI sessions
@@ -1983,14 +1983,45 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         // A pasted <#id> / <@id> mention, or a bare snowflake, is already the answer -- resolve it directly
         // instead of substring-searching for a number that appears in no name.
         if (parsed.id) {
-          const ch = client.channels.cache.get(parsed.id)
+          // BOTH halves resolve cache-then-API. users.cache/channels.cache hold only what discord.js has
+          // already observed, so a miss says nothing about existence. On 2026-08-21 I looked up a real
+          // member of a guild I am in, got "not a user this bot can see", and told the owner twice that
+          // they shared no server with me -- he posted one message and the same lookup resolved instantly.
+          //
+          // The channel half is fixed for the same reason and in the same breath: an ARCHIVED thread is
+          // absent from channels.cache (GUILD_CREATE ships active threads only) but fetches fine, so a
+          // cache-only channel read has the identical failure and the shared error line covers both.
+          const chRes = await resolveById<{ id: string; type: number; name?: string; guild?: { name: string; id: string } }>(
+            (id) => client.channels.cache.get(id) as never,
+            (id) => client.channels.fetch(id) as never,
+            parsed.id,
+          )
+          const ch = chRes.user
           if (ch) {
-            const g = (ch as { guild?: { name: string; id: string } }).guild
-            lines.push(`channel[0] id=${ch.id} name=${JSON.stringify((ch as { name?: string }).name ?? '(dm)')} type=${ChannelType[ch.type] ?? String(ch.type)}${g ? ` guild=${JSON.stringify(g.name)} guild_id=${g.id}` : ''}`)
+            const g = ch.guild
+            lines.push(`channel[0] id=${ch.id} name=${JSON.stringify(ch.name ?? '(dm)')} type=${ChannelType[ch.type] ?? String(ch.type)}${g ? ` guild=${JSON.stringify(g.name)} guild_id=${g.id}` : ''}`)
           }
-          const u = client.users.cache.get(parsed.id)
+          // cache:false -- UserManager.fetch writes to users.cache by default, and the NAME branch below
+          // labels everything it finds there "(seen in messages)". Caching an id lookup would make that
+          // label start lying about someone who has never spoken.
+          const uRes = await resolveById(
+            (id) => client.users.cache.get(id),
+            (id) => client.users.fetch(id, { cache: false }),
+            parsed.id,
+          )
+          const u = uRes.user
           if (u) lines.push(`user[0] id=${u.id} username=${JSON.stringify(u.username)} display=${JSON.stringify(u.globalName ?? u.username)}`)
-          if (lines.length === 0) lines.push(`id ${parsed.id} is not a channel or user this bot can see`)
+          if (lines.length === 0) {
+            // A LOOKUP THAT FAILED IS NOT A LOOKUP THAT FOUND NOTHING -- report absence only when both
+            // halves actually got an answer, or this reintroduces the same lie one layer down.
+            const errs = [
+              chRes.source === 'error' ? `channel: ${chRes.error}` : null,
+              uRes.source === 'error' ? `user: ${uRes.error}` : null,
+            ].filter(Boolean)
+            lines.push(errs.length > 0
+              ? `id ${parsed.id}: lookup FAILED (${errs.join('; ')}) -- cannot say whether it exists`
+              : `id ${parsed.id} matches no channel, and no user with that id exists`)
+          }
           return { content: [{ type: 'text', text: lines.join('\n') }] }
         }
 
