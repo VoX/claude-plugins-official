@@ -26,7 +26,11 @@ they're shown together (e.g. `📖 reading ✏️ editing…`); otherwise each s
 - `--start "🐾 working…"` (UserPromptSubmit) resets the sequence each turn.
 - each PreToolUse **appends** its action: 📖 reading (Read/WebFetch), 🔍 searching (Grep/Glob/WebSearch),
   ✏️ editing (Edit/Write/MultiEdit/NotebookEdit), `>_ bash` (Bash),
-  🤝 delegating (Task/Agent subagent), 💬 replying (Discord reply/embed/voice), 🔄 compacting (PreCompact).
+  🤝 delegating (Task/Agent subagent), 💬 replying (Discord reply/embed/voice/**react**), 🔄 compacting (PreCompact).
+- a **reaction counts as replying** (VoX, 2026-08-25). An emoji is a response — often the whole response,
+  since reacting instead of replying is the cheaper correct move when a message needs acknowledging but not
+  answering — and a turn that answers purely by reacting should not look idle. Read-only Discord tools
+  (fetch_messages, typing, edit_message) deliberately stay unmatched.
 - Bash is a FLAT `>_ bash…` — it does not say which command ran. It used to: a classifier resolved the
   rightmost chain segment and mapped it to an activity verb (cat → 📖 reading, npm → 🔧 building,
   `./deploy.sh` → `⚙️ run deploy.sh…`, and so on). VoX removed it on 2026-08-25 — the extracted name

@@ -9,7 +9,7 @@
       { "matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '✏️ editing…'" } ] },
       { "matcher": "Bash", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '>_ bash…'" } ] },
       { "matcher": "Task|Agent", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🤝 delegating…'" } ] },
-      { "matcher": "mcp__(plugin_discord_)?discord__(reply|bulk_reply|send_embed|send_voice_message)", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '💬 replying…'" } ] }
+      { "matcher": "mcp__(plugin_discord_)?discord__(reply|bulk_reply|react|send_embed|send_voice_message)", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '💬 replying…'" } ] }
     ],
     "PreCompact": [
       { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🔄 compacting…'" } ] }
