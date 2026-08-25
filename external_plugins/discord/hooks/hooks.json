@@ -7,7 +7,7 @@
       { "matcher": "Read|WebFetch", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '📖 reading…'" } ] },
       { "matcher": "Grep|Glob|WebSearch", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🔍 searching…'" } ] },
       { "matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '✏️ editing…'" } ] },
-      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-bash.sh" } ] },
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '>_ bash…'" } ] },
       { "matcher": "Task|Agent", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🤝 delegating…'" } ] },
       { "matcher": "mcp__(plugin_discord_)?discord__(reply|bulk_reply|send_embed|send_voice_message)", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '💬 replying…'" } ] }
     ],

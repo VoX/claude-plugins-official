@@ -11,9 +11,9 @@ set -u
 dir="${DISCORD_STATE_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/discord}"
 f="$dir/.presence-activity"
 mkdir -p "$dir"
-# refresh the context-size prefix from the hook's transcript (its JSON is on stdin). Skipped when stdin
-# was already drained upstream (presence-bash.sh reads it + computes the prefix itself, then execs us)
-# or when run from a tty. context-size.sh no-ops if it can't resolve a transcript, so nothing is clobbered.
+# refresh the context-size prefix from the hook's transcript (its JSON is on stdin). Skipped when run
+# from a tty or when stdin carries nothing usable. context-size.sh no-ops if it can't resolve a
+# transcript, so nothing is clobbered.
 if command -v jq >/dev/null 2>&1 && [ ! -t 0 ]; then
   hook_json="$(cat 2>/dev/null)"
   tp="$(printf '%s' "$hook_json" | jq -r '.transcript_path // ""' 2>/dev/null)"
