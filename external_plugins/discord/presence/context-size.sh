@@ -18,7 +18,11 @@ ctx="$(tac "$tp" 2>/dev/null | grep -m1 '"cache_read_input_tokens"' \
   | jq -r '(.message.usage // .usage) as $u
            | (($u.input_tokens // 0) + ($u.cache_read_input_tokens // 0) + ($u.cache_creation_input_tokens // 0))' \
       2>/dev/null)"
-case "$ctx" in ''|*[!0-9]*) exit 0 ;; esac   # empty / non-numeric → leave the last good prefix in place
+# 0 is REJECTED, not just non-numeric input: a Task/Agent tool-result line carries the SUBAGENT's
+# usage at .toolUseResult.usage.cache_read_input_tokens -- a real nested key, so the grep above matches it,
+# but it has neither .message.usage nor .usage, so the jq yields 0. Treating that as valid overwrote the
+# last good prefix with "0k", the exact opposite of what this line promises.
+case "$ctx" in ''|0|*[!0-9]*) exit 0 ;; esac   # empty / non-numeric → leave the last good prefix in place
 k=$(( (ctx + 500) / 1000 ))                   # round to the nearest 1k
 mkdir -p "$dir"
 tmp="$out.tmp.$$"; printf '%sk' "$k" > "$tmp" && mv -f "$tmp" "$out"   # atomic: a concurrent plugin read never sees a half-written/empty file

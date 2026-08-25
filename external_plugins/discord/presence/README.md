@@ -24,13 +24,29 @@ advances — it is NOT a whole-turn aggregate). When several actions land betwee
 they're shown together (e.g. `📖 reading ✏️ editing…`); otherwise each shows on its own ~1s after it fires.
 
 - `--start "🐾 working…"` (UserPromptSubmit) resets the sequence each turn.
+- `--idle` also fires on **SubagentStop** and **SessionEnd**, not just Stop. A subagent's tool calls append
+  work to the same sequence, but nothing used to settle it when the subagent finished — so after a delegated
+  turn the dot sat green claiming it was still running bash. Safe with parallel subagents because a
+  non-trailing idle is dropped the moment another appends work. **PostCompact** restores `🐾 working…`, which
+  `🔄 compacting…` otherwise outlived.
 - each PreToolUse **appends** its action: 📖 reading (Read/WebFetch), 🔍 searching (Grep/Glob/WebSearch),
   ✏️ editing (Edit/Write/MultiEdit/NotebookEdit), `>_ bash` (Bash),
-  🤝 delegating (Task/Agent subagent), 💬 replying (Discord reply/embed/voice/**react**), 🔄 compacting (PreCompact).
+  🤝 delegating (Task/Agent subagent), 💬 replying (**Discord OR Slack** reply/embed/voice/react),
+  🛠️ configuring (apply_server_spec), 🔄 compacting (PreCompact).
 - a **reaction counts as replying** (VoX, 2026-08-25). An emoji is a response — often the whole response,
   since reacting instead of replying is the cheaper correct move when a message needs acknowledging but not
-  answering — and a turn that answers purely by reacting should not look idle. Read-only Discord tools
-  (fetch_messages, typing, edit_message) deliberately stay unmatched.
+  answering — and a turn that answers purely by reacting should not look idle.
+- **Slack counts too.** The line reports what the BOT is doing, not what it is doing on Discord — it already
+  labels Read/Bash/Edit work that has nothing to do with either channel — so a turn answered entirely in
+  Slack should not read as idle. (Same both-channels matcher the goal plugin already uses.)
+- deliberately unmatched: `fetch_messages`, `typing`, `lookup`, `get_server_spec` (read-only or instant),
+  and `edit_message` — that one MUTATES, so "read-only" was the wrong reason; the real one is that an
+  interim progress edit is not a response.
+- **MATCHER SEMANTICS, easy to get wrong.** A matcher made only of `[A-Za-z0-9_|, -]` is parsed as an
+  EXACT-NAME LIST, not a regex — so `"Bash"` does NOT also catch `BashOutput`, and `"Task|Agent"` does NOT
+  catch `TaskCreate`/`ListAgents`. It becomes a regex only once it contains other punctuation, and that
+  regex is tested UNANCHORED. So a "fix" written as a bare substring like `reply` matches NOTHING, and one
+  written as a loose regex can over-match. The mcp matchers here are anchored with `^…$` for that reason.
 - Bash is a FLAT `>_ bash…` — it does not say which command ran. It used to: a classifier resolved the
   rightmost chain segment and mapped it to an activity verb (cat → 📖 reading, npm → 🔧 building,
   `./deploy.sh` → `⚙️ run deploy.sh…`, and so on). VoX removed it on 2026-08-25 — the extracted name
