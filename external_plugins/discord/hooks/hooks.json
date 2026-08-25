@@ -18,6 +18,9 @@
     "SubagentStop": [
       { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh --idle" } ] }
     ],
+    "TeammateIdle": [
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh --idle" } ] }
+    ],
     "SessionEnd": [
       { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh --idle" } ] }
     ],

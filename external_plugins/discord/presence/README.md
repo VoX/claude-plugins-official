@@ -24,7 +24,11 @@ advances — it is NOT a whole-turn aggregate). When several actions land betwee
 they're shown together (e.g. `📖 reading ✏️ editing…`); otherwise each shows on its own ~1s after it fires.
 
 - `--start "🐾 working…"` (UserPromptSubmit) resets the sequence each turn.
-- `--idle` also fires on **SubagentStop** and **SessionEnd**, not just Stop. A subagent's tool calls append
+- `--idle` also fires on **SubagentStop**, **TeammateIdle** and **SessionEnd**, not just Stop.
+  TeammateIdle is the load-bearing one and was found by TESTING: SubagentStop alone did NOT settle the
+  status after a background `Agent` finished (spawned one, idle count stayed put). The harness groups
+  `["Stop","TeammateIdle","TaskCreated","TaskCompleted"]` together and SubagentStop is NOT in that group —
+  a backgrounded agent surfaces as a TEAMMATE, so SubagentStop covers the synchronous path only. A subagent's tool calls append
   work to the same sequence, but nothing used to settle it when the subagent finished — so after a delegated
   turn the dot sat green claiming it was still running bash. Safe with parallel subagents because a
   non-trailing idle is dropped the moment another appends work. **PostCompact** restores `🐾 working…`, which
