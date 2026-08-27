@@ -5,7 +5,10 @@ import {
   buildServerSpec, computeSpecDiff, renderSpecDiff, overwriteEditMap, grantGroup, removeGroup, makeTtlCache,
   normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank,
   grantDm, removeDm, resolveById,
-  type RawGuildState, type ServerSpec } from './lib'
+  planRolePositions,
+  resolveOrderingConstraints,
+  namedOrderingConstraints,
+  type RawGuildState, type ServerSpec, type RolePositionInput } from './lib'
 
 describe('safeSlice', () => {
   test('returns input unchanged when shorter than limit', () => {
@@ -348,9 +351,12 @@ function fixtureState(): RawGuildState {
     guildId: 'g1',
     everyonePermissions: ['ViewChannel', 'SendMessages'],
     roles: [
-      { id: 'r1', name: 'Mod', hexColor: '#5865f2', hoist: true, mentionable: false, permissions: ['KickMembers', 'ViewChannel'], position: 2, managed: false },
-      { id: 'r2', name: 'Member', hexColor: '#000000', hoist: false, mentionable: true, permissions: ['ViewChannel'], position: 1, managed: false },
-      { id: 'r3', name: 'SomeBot', hexColor: '#000000', hoist: false, mentionable: false, permissions: ['Administrator'], position: 3, managed: true },
+      // Deliberately adversarial: array order says Member first, RANK says Member first,
+      // RAW says Mod first. The export must say Mod first, so neither dropping the sort
+      // nor sorting on the rank can pass.
+      { id: 'r2', name: 'Member', hexColor: '#000000', hoist: false, mentionable: true, permissions: ['ViewChannel'], position: 2, rawPosition: 5, managed: false },
+      { id: 'r1', name: 'Mod', hexColor: '#5865f2', hoist: true, mentionable: false, permissions: ['KickMembers', 'ViewChannel'], position: 1, rawPosition: 8, managed: false },
+      { id: 'r3', name: 'SomeBot', hexColor: '#000000', hoist: false, mentionable: false, permissions: ['Administrator'], position: 3, rawPosition: 9, managed: true },
     ],
     channels: [
       { id: 'c1', name: 'Staff', type: 4, parentId: null, position: 0, topic: null, rateLimitPerUser: null, nsfw: false,
@@ -369,13 +375,86 @@ describe('buildServerSpec', () => {
     expect(spec.everyone_permissions).toEqual(['SendMessages', 'ViewChannel'])
   })
 
+  // THE BUG THIS FILE DID NOT CATCH. buildServerSpec exported discord.js's Role.position
+  // -- a computed sorted RANK -- through a field the tool documents as "exactly the shape
+  // apply_server_spec consumes". A rank cannot be PATCHed back and can never show a tie, so
+  // a guild with every role at raw 1 reported a tidy 3/2/1 and the ties were invisible. The
+  // fixtures deliberately give rank and raw DIFFERENT values now, so confusing the two fails.
+  test('role position exports the RAW value, not the sorted rank', () => {
+    const spec = buildServerSpec(fixtureState())
+    const mod = spec.roles!.find(r => r.name === 'Mod')!
+    expect(mod.position).toBe(8)     // rawPosition
+    expect(mod.position).not.toBe(1) // Role.position, the rank
+  })
+
+  test('roles TIED at the same raw position both report the tie', () => {
+    // A tie is real information: tied roles order by id, and a bot cannot reorder roles it
+    // is tied with. An export that renumbers them 2/1 hides the reason a reorder will fail.
+    // Own fixture, because the shared one is built to disagree on every axis.
+    const tied = fixtureState()
+    tied.roles = [
+      { id: '200', name: 'Newer', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 1, rawPosition: 1, managed: false },
+      { id: '100', name: 'Older', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 2, rawPosition: 1, managed: false },
+    ]
+    const spec = buildServerSpec(tied)
+    expect(spec.roles!.map(r => r.position)).toEqual([1, 1])
+    // and the tie resolves the way Discord resolves it: older snowflake ranks HIGHER
+    expect(spec.roles!.map(r => r.name)).toEqual(['Older', 'Newer'])
+  })
+
+  test('the tie-break is BigInt, not a string compare', () => {
+    // Snowflakes crossed 18 -> 19 digits on 2022-07-22. localeCompare puts EVERY 19-digit id
+    // before every 18-digit one, so a guild with roles from both sides of that date exports
+    // its hierarchy inverted -- and every id in the other fixtures is the same length, so
+    // nothing else here can see it.
+    const mixed = fixtureState()
+    mixed.roles = [
+      { id: '1000000000000000000', name: 'Newer19', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 1, rawPosition: 4, managed: false },
+      { id: '999999999999999999', name: 'Older18', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 2, rawPosition: 4, managed: false },
+    ]
+    expect(buildServerSpec(mixed).roles!.map(r => r.name)).toEqual(['Older18', 'Newer19'])
+  })
+
+  test('a position MATCHING the live raw position is accepted as a no-op', () => {
+    // The documented round-trip: get_server_spec's output fed straight back must not fail,
+    // and must not report a change. position is in that output, so rejecting it outright
+    // would break the contract four places in the tool descriptions promise.
+    const diff = computeSpecDiff(buildServerSpec(fixtureState()), { roles: [{ name: 'Mod', position: 8 }] })
+    expect(diff.entries.find(e => e.kind === 'role' && e.name === 'Mod')).toBeUndefined()
+  })
+
+  test('a position DIFFERING from the live raw position is a hard error', () => {
+    // Silently ignoring it was the original bug -- apply answered "already matches, 0 changes"
+    // to a reorder it never compared. Diffing it was the wrong fix: Discord treats a position
+    // in a partial write as advisory and normalises the guild on a complete one, so "set this
+    // role to 3" is not an operation the API offers.
+    expect(() => computeSpecDiff(buildServerSpec(fixtureState()), { roles: [{ name: 'Mod', position: 3 }] }))
+      .toThrow(/position 3 does not match its live raw position 8/)
+  })
+
+  test('position on a role being CREATED is a hard error, not a silent drop', () => {
+    // POST /guilds/{id}/roles has no position field at all (measured: asked for 3, landed at 1), so
+    // a create can never honour it. The docs said a differing position is an error; the check lived
+    // only in the modify branch, so on a create it was silently dropped -- the exact silent-drop this
+    // whole change exists to remove, reintroduced one branch over.
+    expect(() => computeSpecDiff(buildServerSpec(fixtureState()), { roles: [{ name: 'Brand New', position: 3 }] }))
+      .toThrow(/remove `position`/)
+  })
+
+  test('a create with NO position still works, and prints no position change', () => {
+    const diff = computeSpecDiff(buildServerSpec(fixtureState()), { roles: [{ name: 'Brand New' }] })
+    const created = diff.entries.find(e => e.kind === 'role' && e.name === 'Brand New')!
+    expect(created.op).toBe('create')
+    expect(created.changes.find(c => c.field === 'position')).toBeUndefined()
+  })
+
   test('excludes managed roles, sorts by position (highest first)', () => {
     expect(spec.roles!.map(r => r.name)).toEqual(['Mod', 'Member'])
   })
 
   test('serializes role fields, omitting defaults', () => {
     const mod = spec.roles![0]!
-    expect(mod).toEqual({ name: 'Mod', id: 'r1', color: '#5865f2', hoist: true, permissions: ['KickMembers', 'ViewChannel'], position: 2 })
+    expect(mod).toEqual({ name: 'Mod', id: 'r1', color: '#5865f2', hoist: true, permissions: ['KickMembers', 'ViewChannel'], position: 8 })
     const member = spec.roles![1]!
     expect(member.color).toBeUndefined()   // #000000 = no color
     expect(member.hoist).toBeUndefined()
@@ -408,7 +487,7 @@ describe('buildServerSpec', () => {
 
   test('keeps raw snowflake for ambiguous duplicate role names', () => {
     const state = fixtureState()
-    state.roles.push({ id: 'r4', name: 'Mod', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 0, managed: false })
+    state.roles.push({ id: 'r4', name: 'Mod', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 0, rawPosition: 0, managed: false })
     const s = buildServerSpec(state)
     const modLog = s.categories![0]!.channels![0]!
     expect(modLog.overwrites![0]!.id).toBe('r1')
@@ -559,7 +638,7 @@ describe('computeSpecDiff', () => {
 
   test('throws when targeting an ambiguous duplicate role name in the guild', () => {
     const state = fixtureState()
-    state.roles.push({ id: 'r4', name: 'Mod', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 0, managed: false })
+    state.roles.push({ id: 'r4', name: 'Mod', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 0, rawPosition: 0, managed: false })
     expect(() => computeSpecDiff(buildServerSpec(state), { roles: [{ name: 'Mod', hoist: false }] }))
       .toThrow(/ambiguous/)
   })
@@ -964,7 +1043,7 @@ describe('grantDm / removeDm', () => {
 
   test('granting CLEARS that user pending pairing code, but leaves other people alone', () => {
     const allow: string[] = []
-    const pending = { aaa: { senderId: '42' }, bbb: { senderId: '99' } }
+    const pending: Record<string, { senderId: string }> = { aaa: { senderId: '42' }, bbb: { senderId: '99' } }
     grantDm(allow, pending, '42')
     expect(pending).toEqual({ bbb: { senderId: '99' } })
   })
@@ -983,7 +1062,7 @@ describe('grantDm / removeDm', () => {
 
   test('grant then remove is a round trip -- no residue in allowFrom or pending', () => {
     const allow: string[] = []
-    const pending = { aaa: { senderId: '42' } }
+    const pending: Record<string, { senderId: string }> = { aaa: { senderId: '42' } }
     grantDm(allow, pending, '42')
     removeDm(allow, '42')
     expect(allow).toEqual([])
@@ -1055,5 +1134,378 @@ describe('resolveById', () => {
 
   test('never rejects — lookup has to answer', async () => {
     await expect(resolveById(() => undefined, async () => { throw new Error('boom') }, '9')).resolves.toBeDefined()
+  })
+})
+
+// ── planRolePositions ──
+// The pure core of role reordering. Every case below names the defect it pins; the
+// facts they encode were measured against a live guild, not inferred from docs.
+describe('planRolePositions', () => {
+  // LSS as it actually stands. tinyclaw (the bot) is the top role, so everything
+  // under it is movable and @everyone is pinned at raw 0.
+  const EVERYONE = '1', TINYCLAW = '500', OWNER = '400', BOT = '300', MOD = '100', LODE = '200'
+  const lss = (): RolePositionInput[] => [
+    { id: EVERYONE, name: '@everyone', rawPosition: 0, managed: false },
+    { id: LODE, name: 'Lodestone', rawPosition: 1, managed: false },
+    { id: MOD, name: 'Moderator', rawPosition: 2, managed: false },
+    { id: BOT, name: 'Bot', rawPosition: 3, managed: false },
+    { id: OWNER, name: 'Owner', rawPosition: 4, managed: false },
+    { id: TINYCLAW, name: 'tinyclaw', rawPosition: 5, managed: true },
+  ]
+  const ctx = { botHighestRoleId: TINYCLAW, everyoneRoleId: EVERYONE }
+  const ok = (p: ReturnType<typeof planRolePositions>) => {
+    if ('refusal' in p) throw new Error(`expected a plan, got refusal ${JSON.stringify(p.refusal)}`)
+    return p
+  }
+  const refusal = (p: ReturnType<typeof planRolePositions>) => {
+    if (!('refusal' in p)) throw new Error(`expected a refusal, got ${JSON.stringify(p.writes)}`)
+    return p.refusal
+  }
+  /** highest-first names, read back out of a writes[] body */
+  const orderOf = (roles: RolePositionInput[], writes: Array<{ id: string; position: number }>) =>
+    [...writes].sort((a, b) => b.position - a.position).map(w => roles.find(r => r.id === w.id)!.name)
+
+  test('an ALREADY-SATISFIED constraint set emits zero writes — and an unsatisfied one does not', () => {
+    // Paired deliberately: a planner that returned [] unconditionally would pass the
+    // first half on its own, and "no writes" is exactly the shape of the original bug
+    // (apply reporting "0 changes" for a reorder it never compared).
+    const satisfied = ok(planRolePositions(lss(), [{ id: OWNER, above: [MOD] }], ctx))
+    expect(satisfied.writes).toEqual([])
+
+    const unsatisfied = ok(planRolePositions(lss(), [{ id: LODE, above: [OWNER] }], ctx))
+    expect(unsatisfied.writes.length).toBeGreaterThan(0)
+  })
+
+  test('no constraints at all is a fixpoint — the toposort does not reshuffle free roles', () => {
+    // Kahn with an unordered ready-set gives ANY valid topological order, so a guild
+    // with no constraints would get shuffled and written back for no reason. The
+    // priority queue keyed by current rank is what makes this hold.
+    expect(ok(planRolePositions(lss(), [], ctx)).writes).toEqual([])
+  })
+
+  test('the write body is COMPLETE and contiguous, because a partial one is advisory', () => {
+    // Measured: a one-entry body asking for position 3 landed at 2. Only a complete
+    // body is honoured verbatim, and Discord densifies it regardless of what we send.
+    const plan = ok(planRolePositions(lss(), [{ id: LODE, above: [OWNER] }], ctx))
+    expect(plan.writes.length).toBe(6)                       // every role, not just the moved one
+    expect(plan.writes.map(w => w.position).sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5])
+    expect(orderOf(lss(), plan.writes)).toEqual(['tinyclaw', 'Lodestone', 'Owner', 'Bot', 'Moderator', '@everyone'])
+  })
+
+  test('@everyone stays at position 0 and the frozen ceiling stays on top', () => {
+    const plan = ok(planRolePositions(lss(), [{ id: LODE, above: [OWNER] }], ctx))
+    expect(plan.writes.find(w => w.id === EVERYONE)!.position).toBe(0)
+    expect(plan.writes.find(w => w.id === TINYCLAW)!.position).toBe(5)
+    expect(plan.frozen).toEqual([TINYCLAW, EVERYONE])
+  })
+
+  test('frozen roles are EMITTED but never moved', () => {
+    // They have to be in the body — Discord only honours a complete one — but the
+    // bot cannot move a role at or above its own, so their order is carried through
+    // untouched rather than being planned around.
+    const plan = ok(planRolePositions(lss(), [{ id: LODE, above: [OWNER] }], ctx))
+    const live = lss()
+    for (const id of plan.frozen) {
+      const before = live.find(r => r.id === id)!.rawPosition
+      expect(plan.writes.find(w => w.id === id)!.position).toBe(before)
+    }
+  })
+
+  test('a constraint naming a role above the ceiling REFUSES and names it', () => {
+    // The two-sided gate: source AND destination must rank below the bot's highest.
+    // Discord answers this with a bare 50013 that says nothing about which role blocked.
+    const r = refusal(planRolePositions(lss(), [{ id: OWNER, above: [TINYCLAW] }], ctx))
+    expect(r.kind).toBe('frozen')
+    expect((r as { blockingRoleIds: string[] }).blockingRoleIds).toContain(TINYCLAW)
+  })
+
+  test('a constraint naming @everyone refuses rather than silently doing nothing', () => {
+    const r = refusal(planRolePositions(lss(), [{ id: MOD, below: [EVERYONE] }], ctx))
+    expect(r.kind).toBe('frozen')
+    expect((r as { blockingRoleIds: string[] }).blockingRoleIds).toContain(EVERYONE)
+  })
+
+  test('a cycle refuses, and carries NO ceiling field to fabricate', () => {
+    // The refusal is a discriminated union precisely so this case cannot be forced to
+    // invent a number: a ceiling is meaningful for a frozen refusal and meaningless here.
+    const r = refusal(planRolePositions(lss(), [{ id: MOD, above: [BOT] }, { id: BOT, above: [MOD] }], ctx))
+    expect(r.kind).toBe('cycle')
+    expect(r).not.toHaveProperty('ceiling')
+    expect((r as { roleIds: string[] }).roleIds.sort()).toEqual([MOD, BOT].sort())
+  })
+
+  test('one statement naming the same role above AND below itself is a contradiction, not a cycle', () => {
+    // Reported separately because a cycle refusal names a path; this names the sentence.
+    const r = refusal(planRolePositions(lss(), [{ id: MOD, above: [BOT], below: [BOT] }], ctx))
+    expect(r.kind).toBe('contradiction')
+    expect((r as { roleIds: string[] }).roleIds).toContain(BOT)
+  })
+
+  test('an unknown role id refuses before anything else looks at it', () => {
+    const r = refusal(planRolePositions(lss(), [{ id: MOD, above: ['999999'] }], ctx))
+    expect(r.kind).toBe('unknown-role')
+    expect((r as { ids: string[] }).ids).toContain('999999')
+  })
+
+  test('a fully TIED guild is ordered by snowflake, older role higher', () => {
+    // The motivating case: a fresh guild has every role at raw 1, which discord.js's
+    // Role.position renders as a tidy 3/2/1 and the export used to report as fact.
+    const tied: RolePositionInput[] = [
+      { id: '1', name: '@everyone', rawPosition: 0, managed: false },
+      { id: '900', name: 'Newest', rawPosition: 1, managed: false },
+      { id: '700', name: 'Middle', rawPosition: 1, managed: false },
+      { id: '500', name: 'BotRole', rawPosition: 1, managed: true },
+    ]
+    const plan = ok(planRolePositions(tied, [{ id: '900', above: ['700'] }], { botHighestRoleId: '500', everyoneRoleId: '1' }))
+    expect(orderOf(tied, plan.writes)).toEqual(['BotRole', 'Newest', 'Middle', '@everyone'])
+  })
+
+  test('the tie-break is BigInt: a 19-digit id does not outrank an older 18-digit one', () => {
+    const mixed: RolePositionInput[] = [
+      { id: '1', name: '@everyone', rawPosition: 0, managed: false },
+      { id: '1000000000000000000', name: 'Newer19', rawPosition: 1, managed: false },
+      { id: '999999999999999999', name: 'Older18', rawPosition: 1, managed: false },
+      { id: '111111111111111111', name: 'BotRole', rawPosition: 2, managed: true },
+    ]
+    // A constraint that forces a WRITE without saying anything about the tied pair, so the emitted
+    // order has to reveal how the tie was broken. The first version of this test passed zero
+    // constraints, which made it a fixpoint under any tie-break at all: it compared the sort against
+    // itself and stayed green with localeCompare substituted in.
+    // Mover's id is the LARGEST of the three tied at raw 1, so it starts BELOW both and the
+    // constraint genuinely forces a write. It names only Older18, so nothing dictates where Newer19
+    // lands relative to Older18 -- the emitted order has to reveal how the tie was broken.
+    mixed.push({ id: '1100000000000000000', name: 'Mover', rawPosition: 1, managed: false })
+    const plan = ok(planRolePositions(mixed, [{ id: '1100000000000000000', above: ['999999999999999999'] }],
+      { botHighestRoleId: '111111111111111111', everyoneRoleId: '1' }))
+    expect(plan.writes.length).toBeGreaterThan(0)
+    expect(orderOf(mixed, plan.writes)).toEqual(['BotRole', 'Mover', 'Older18', 'Newer19', '@everyone'])
+  })
+
+  test("VoX's actual request: put Owner above Moderator, and Bot between them", () => {
+    const plan = ok(planRolePositions(lss(), [{ id: OWNER, above: [BOT] }, { id: BOT, above: [MOD] }], ctx))
+    expect(plan.writes).toEqual([])   // already true on LSS today, and saying so beats writing
+  })
+
+  test('a NEW role placed between two existing ones moves only itself', () => {
+    // The pending live request: add "VSS Maintainer" directly below the top role and
+    // above Bot. A new role lands at the bottom (raw 1, tied), so it has to travel --
+    // but nothing else should. This is the case that exposed the rebuild-from-graph
+    // implementation: it satisfied both clauses while hoisting Moderator and Lodestone
+    // over the new role AND sinking Bot to the floor.
+    const VSS = '600'
+    const withNew = [...lss(), { id: VSS, name: 'VSS Maintainer', rawPosition: 1, managed: false }]
+    const plan = ok(planRolePositions(withNew, [{ id: VSS, below: [OWNER], above: [BOT] }], ctx))
+    expect(orderOf(withNew, plan.writes))
+      .toEqual(['tinyclaw', 'Owner', 'VSS Maintainer', 'Bot', 'Moderator', 'Lodestone', '@everyone'])
+  })
+
+  test('everything not named keeps its neighbours, not merely its relative order', () => {
+    // "Relative order preserved" is satisfiable by an answer that still drags every
+    // uninvolved role across the guild. Pin the stronger property: one constraint,
+    // one role changes rank.
+    const before = ['tinyclaw', 'Owner', 'Bot', 'Moderator', 'Lodestone', '@everyone']
+    const plan = ok(planRolePositions(lss(), [{ id: LODE, above: [MOD] }], ctx))
+    const after = orderOf(lss(), plan.writes)
+    expect(after).toEqual(['tinyclaw', 'Owner', 'Bot', 'Lodestone', 'Moderator', '@everyone'])
+    const moved = after.filter((n, i) => n !== before[i])
+    expect(moved.sort()).toEqual(['Lodestone', 'Moderator'])   // the pair that swapped, and nothing else
+  })
+})
+
+
+// ── the chain case, which is the one the first repair implementation got backwards ──
+describe('planRolePositions — chains and multi-subject sets', () => {
+  const mk = (names: Array<[string, string, number]>, managedId: string): RolePositionInput[] =>
+    names.map(([id, name, raw]) => ({ id, name, rawPosition: raw, managed: id === managedId }))
+  const plan = (roles: RolePositionInput[], cs: Array<{ id: string; above?: string[]; below?: string[] }>) =>
+    planRolePositions(roles, cs, { botHighestRoleId: '500', everyoneRoleId: '1' })
+  const order = (roles: RolePositionInput[], p: ReturnType<typeof planRolePositions>) => {
+    if ('refusal' in p) return `REFUSED:${p.refusal.kind}`
+    if (p.writes.length === 0) return 'NO-WRITE'
+    return [...p.writes].sort((a, b) => b.position - a.position).map(w => roles.find(r => r.id === w.id)!.name).join(' > ')
+  }
+
+  test("a clause naming ANOTHER SUBJECT is honoured — VoX's own request, which came out inverted", () => {
+    // "Owner above Bot" + "Bot above Moderator". The first implementation lifted every subject out of
+    // the list and re-inserted them in topological order, so when Owner was placed, Bot was not on the
+    // board, indexOf returned -1, and the clause was SILENTLY DROPPED. Result: Owner below Moderator,
+    // the exact inverse of the request, reported as success.
+    const roles = mk([['1', '@everyone', 0], ['200', 'Lodestone', 1], ['400', 'Owner', 2],
+                      ['300', 'Bot', 3], ['100', 'Moderator', 4], ['500', 'tinyclaw', 5]], '500')
+    expect(order(roles, plan(roles, [{ id: '400', above: ['300'] }, { id: '300', above: ['100'] }])))
+      .toBe('tinyclaw > Owner > Bot > Moderator > Lodestone > @everyone')
+  })
+
+  test('the same request phrased with `below` gives the same answer', () => {
+    // The direction the user phrases it in must not decide whether the constraint is honoured. Under
+    // the first implementation it did: `below` happened to work because its target was placed earlier.
+    const roles = mk([['1', '@everyone', 0], ['200', 'Lodestone', 1], ['400', 'Owner', 2],
+                      ['300', 'Bot', 3], ['100', 'Moderator', 4], ['500', 'tinyclaw', 5]], '500')
+    expect(order(roles, plan(roles, [{ id: '300', below: ['400'] }, { id: '100', below: ['300'] }])))
+      .toBe('tinyclaw > Owner > Bot > Moderator > Lodestone > @everyone')
+  })
+
+  test('a three-link chain against a fully reversed guild', () => {
+    const roles = mk([['1', '@everyone', 0], ['100', 'A', 1], ['200', 'B', 2],
+                      ['300', 'C', 3], ['400', 'D', 4], ['500', 'bot', 9]], '500')
+    expect(order(roles, plan(roles, [{ id: '100', above: ['200'] }, { id: '200', above: ['300'] }, { id: '300', above: ['400'] }])))
+      .toBe('bot > A > B > C > D > @everyone')
+  })
+
+  test('a satisfiable set is NOT refused as a contradiction', () => {
+    // The window used to be computed against non-subjects only, and non-subjects never move -- so a
+    // set that needed one of them to shift was reported as clauses that "cannot all hold at once".
+    // 14% of random satisfiable sets hit it; it needs one constraint and three roles.
+    const roles = mk([['1', '@everyone', 0], ['400', 'Admin', 1], ['300', 'Owner', 2],
+                      ['100', 'Moderator', 3], ['500', 'tinyclaw', 5]], '500')
+    expect(order(roles, plan(roles, [{ id: '300', above: ['100'], below: ['400'] }])))
+      .toBe('tinyclaw > Admin > Owner > Moderator > @everyone')
+  })
+
+  test('a cycle refusal names only the roles IN the cycle', () => {
+    // Kahn leaves behind the cycle AND everything downstream, and reporting the lot tells the owner
+    // that roles with no cyclic clause "form a cycle".
+    const roles = mk([['1', '@everyone', 0], ['100', 'A', 1], ['200', 'B', 2],
+                      ['300', 'C', 3], ['400', 'D', 4], ['500', 'bot', 9]], '500')
+    const p = plan(roles, [{ id: '100', above: ['200'] }, { id: '200', above: ['100'] }, { id: '300', above: ['400'] }, { id: '400', above: ['100'] }])
+    if (!('refusal' in p)) throw new Error('expected a refusal')
+    expect(p.refusal.kind).toBe('cycle')
+    expect(((p.refusal as { roleIds: string[] }).roleIds).sort()).toEqual(['100', '200'])
+  })
+
+  test('an unknown role is reported once, not once per mention', () => {
+    const roles = mk([['1', '@everyone', 0], ['100', 'A', 1], ['500', 'bot', 9]], '500')
+    const p = plan(roles, [{ id: '100', above: ['999'], below: ['999'] }])
+    if (!('refusal' in p)) throw new Error('expected a refusal')
+    expect((p.refusal as { ids: string[] }).ids).toEqual(['999'])
+  })
+
+  test('frozen roles keep their EXACT raw position, on a guild with gaps', () => {
+    // Gaps are the normal state after any delete. Numbering everything contiguously renumbered the
+    // roles above the ceiling -- and the only measured fact about those is that MOVING one is 50013.
+    const roles = mk([['1', '@everyone', 0], ['100', 'Low', 1], ['200', 'Mid', 4],
+                      ['300', 'High', 7], ['500', 'bot', 9], ['600', 'Above', 12]], '500')
+    const p = plan(roles, [{ id: '100', above: ['200'] }])
+    if ('refusal' in p) throw new Error('expected a plan')
+    expect(p.writes.find(w => w.id === '600')!.position).toBe(12)   // foreign role above the ceiling
+    expect(p.writes.find(w => w.id === '500')!.position).toBe(9)    // the bot's own
+    expect(p.writes.find(w => w.id === '1')!.position).toBe(0)      // @everyone stays pinned
+    expect([...p.writes].sort((a, b) => b.position - a.position).map(w => roles.find(r => r.id === w.id)!.name))
+      .toEqual(['Above', 'bot', 'High', 'Low', 'Mid', '@everyone'])
+  })
+
+  test('roles the spec CREATES are projected in creation order, not reversed', () => {
+    // Discord assigns ascending snowflakes and the smaller id ranks HIGHER, so the first role created
+    // lands above the second. The projection used descending placeholders and had them backwards --
+    // which made a spec whose two new roles constrain each other look already-satisfied, emit no
+    // ordering entry, and report success on a spec it had not satisfied.
+    const state = fixtureState()
+    const diff = computeSpecDiff(buildServerSpec(state), {
+      roles: [{ name: 'Alpha' }, { name: 'Beta', above: 'Alpha' }],
+    }, {
+      guildId: 'g1', botHighestRoleId: 'r3',
+      allRoles: [{ id: 'g1', name: '@everyone', rawPosition: 0, managed: false },
+                 ...state.roles.map(r => ({ id: r.id, name: r.name, rawPosition: r.rawPosition, managed: r.managed }))],
+    })
+    const ord = diff.entries.find(e => e.kind === 'ordering')
+    expect(ord).toBeDefined()   // Beta must be lifted above Alpha; "already satisfied" is the bug
+    const after = ord!.ordering!.after.map(r => r.name)
+    expect(after.indexOf('Beta')).toBeLessThan(after.indexOf('Alpha'))
+  })
+})
+
+// ── dangerousReorder ──
+describe('dangerousReorder via computeSpecDiff', () => {
+  const guild = (): RawGuildState => ({
+    guildId: 'g1', everyonePermissions: [], channels: [],
+    roles: [
+      { id: '100', name: 'Peon', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 1, rawPosition: 1, managed: false },
+      { id: '200', name: 'Admin', hexColor: '#000000', hoist: false, mentionable: false, permissions: ['Administrator'], position: 2, rawPosition: 2, managed: false },
+      { id: '300', name: 'bot', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 3, rawPosition: 3, managed: true },
+    ],
+  })
+  const opts = () => ({
+    guildId: 'g1', botHighestRoleId: '300',
+    allRoles: [{ id: 'g1', name: '@everyone', rawPosition: 0, managed: false },
+               ...guild().roles.map(r => ({ id: r.id, name: r.name, rawPosition: r.rawPosition, managed: r.managed }))],
+  })
+
+  test('a PARTIAL spec still warns when a role is lifted over an Administrator holder', () => {
+    // The check read permissions from the SPEC only. apply_server_spec is additive, so the ordinary
+    // partial spec -- exactly the shape the tool description advertises -- restates nobody's
+    // permissions, every role reads as harmless, and the owner's approval DM showed NO warning while
+    // a role was lifted over an Administrator holder. The live permissions were in `current` all along.
+    const diff = computeSpecDiff(buildServerSpec(guild()), { roles: [{ name: 'Peon', above: 'Admin' }] }, opts())
+    const ord = diff.entries.find(e => e.kind === 'ordering')!
+    expect(ord.dangerous.join(' ')).toContain('"Peon" now ranks above "Admin"')
+  })
+
+  test('a role that keeps its INDEX but crosses an Administrator holder is still flagged', () => {
+    // The first version used the absolute index delta as a proxy for "gained rank"; a role can keep
+    // its index and still cross another role, and it was the role the user actually named.
+    const state = guild()
+    state.roles.push({ id: '050', name: 'Third', hexColor: '#000000', hoist: false, mentionable: false, permissions: [], position: 0, rawPosition: 0, managed: false })
+    const o = { ...opts(), allRoles: [{ id: 'g1', name: '@everyone', rawPosition: 0, managed: false },
+                                      ...state.roles.map(r => ({ id: r.id, name: r.name, rawPosition: r.rawPosition, managed: r.managed }))] }
+    const diff = computeSpecDiff(buildServerSpec(state), { roles: [{ name: 'Third', above: 'Admin' }] }, o)
+    const ord = diff.entries.find(e => e.kind === 'ordering')!
+    expect(ord.dangerous.join(' ')).toContain('"Third" now ranks above "Admin"')
+  })
+})
+
+
+// ── resolveOrderingConstraints (§5a) ──
+// Zero tests before this, on the exact bug class §5a exists to prevent: both the ambiguous-name and
+// the zero-match paths could be turned into a silent pick-first / silent skip and the suite stayed green.
+describe('resolveOrderingConstraints', () => {
+  const roles: RolePositionInput[] = [
+    { id: '1', name: '@everyone', rawPosition: 0, managed: false },
+    { id: '100', name: 'Moderator', rawPosition: 1, managed: false },
+    { id: '200', name: 'Owner', rawPosition: 2, managed: false },
+  ]
+
+  test('resolves names to ids', () => {
+    expect(resolveOrderingConstraints(roles, [{ subject: 'Owner', above: ['Moderator'], below: [] }]))
+      .toEqual([{ id: '200', above: ['100'], below: [] }])
+  })
+
+  test('a name that will NOT exist after the spec is applied throws, never silently skips', () => {
+    expect(() => resolveOrderingConstraints(roles, [{ subject: 'Owner', above: ['Ghost'], below: [] }]))
+      .toThrow(/no role named "Ghost" will exist/)
+  })
+
+  test('an AMBIGUOUS name throws rather than picking one', () => {
+    const dupes = [...roles, { id: '300', name: 'Owner', rawPosition: 3, managed: false }]
+    expect(() => resolveOrderingConstraints(dupes, [{ subject: 'Moderator', above: ['Owner'], below: [] }]))
+      .toThrow(/is ambiguous/)
+  })
+
+  test('the SUBJECT is resolved the same way', () => {
+    expect(() => resolveOrderingConstraints(roles, [{ subject: 'Ghost', above: ['Owner'], below: [] }]))
+      .toThrow(/no role named "Ghost" will exist/)
+  })
+
+  test('names are the FINAL names — a spec that renames must use the new one', () => {
+    // The §5a headline rule, and nothing pinned it: deleting the rename projection left the suite green.
+    const state = fixtureState()
+    const all = [{ id: 'g1', name: '@everyone', rawPosition: 0, managed: false },
+                 ...state.roles.map(r => ({ id: r.id, name: r.name, rawPosition: r.rawPosition, managed: r.managed }))]
+    const opts = { guildId: 'g1', botHighestRoleId: 'r3', allRoles: all }
+    // Mod -> Overlord, and Member must sit above it. Naming the NEW name works...
+    expect(() => computeSpecDiff(buildServerSpec(state),
+      { roles: [{ id: 'r1', name: 'Overlord' }, { name: 'Member', id: 'r2', above: 'Overlord' }] }, opts)).not.toThrow()
+    // ...and naming the OLD one is refused, rather than quietly matching a role that is about to
+    // stop having that identity.
+    expect(() => computeSpecDiff(buildServerSpec(state),
+      { roles: [{ id: 'r1', name: 'Overlord' }, { name: 'Member', id: 'r2', above: 'Mod' }] }, opts))
+      .toThrow(/no role named "Mod" will exist/)
+  })
+
+  test('namedOrderingConstraints accepts a single name or a list', () => {
+    expect(namedOrderingConstraints({ roles: [{ name: 'A', above: 'B' }] }))
+      .toEqual([{ subject: 'A', above: ['B'], below: [] }])
+    expect(namedOrderingConstraints({ roles: [{ name: 'A', above: ['B', 'C'], below: 'D' }] }))
+      .toEqual([{ subject: 'A', above: ['B', 'C'], below: ['D'] }])
+    expect(namedOrderingConstraints({ roles: [{ name: 'A' }] })).toEqual([])
   })
 })

@@ -243,7 +243,29 @@ export type SpecRole = {
   mentionable?: boolean
   /** PermissionFlagsBits names, e.g. ['ViewChannel', 'KickMembers']. */
   permissions?: string[]
-  /** Applied on create only — reordering existing roles is out of scope. */
+  /** Put this role ABOVE the named role(s) in the hierarchy. Names, resolved against
+   *  the guild as it will look AFTER this spec's creates and renames — so a spec that
+   *  renames "Moderator" to "op" must say `above: "op"`. An unresolvable or ambiguous
+   *  name is an error, never a silent skip. This is how you reorder; `position` is not. */
+  above?: string | string[]
+  /** Put this role BELOW the named role(s). See `above`. */
+  below?: string | string[]
+  /** READ-ONLY. The role's RAW position — the number Discord stores, NOT a 1..N
+   *  ranking. Roles routinely TIE here (a fresh guild can have every role at 1), and
+   *  a tie is real information: tied roles are ordered by id, and a bot cannot
+   *  reorder roles it is tied with.
+   *
+   *  It is exported so you can SEE the hierarchy. It is not an instruction, and it
+   *  is not the unit you would reorder in even if it were: Discord treats a position
+   *  in a partial write as ADVISORY (asked for 3, placed at 2 — measured), and
+   *  normalises the whole guild to contiguous numbers on any complete write. Supply
+   *  it unchanged (a round-tripped export is a no-op) or omit it; a DIFFERENT value
+   *  is a hard error rather than something silently dropped.
+   *
+   *  This used to export discord.js's `Role.position`, a computed sorted INDEX. That
+   *  reads as authoritative, can never show a tie, and cannot be fed back to the API
+   *  — so a spec containing it was not, as the tool claims, "exactly the shape
+   *  apply_server_spec consumes". */
   position?: number
 }
 
@@ -284,7 +306,11 @@ export type ServerSpec = {
 export type RawOverwrite = { id: string; type: 'role' | 'member'; allow: string[]; deny: string[] }
 export type RawRole = {
   id: string; name: string; hexColor: string; hoist: boolean; mentionable: boolean
-  permissions: string[]; position: number; managed: boolean
+  permissions: string[]; managed: boolean
+  /** discord.js Role.position — the computed sorted RANK. Use it to ORDER the export. */
+  position: number
+  /** The API's stored value. Use it for anything that is compared or sent back. */
+  rawPosition: number
 }
 export type RawChannel = {
   id: string; name: string; type: number; parentId: string | null; position: number
@@ -407,16 +433,26 @@ export function buildServerSpec(state: RawGuildState): ServerSpec {
       .sort(byPosition)
       .map(specChannel)
 
+  // Order by the RAW position, with Discord's own tie-break, so the export reads
+  // in true hierarchy order INCLUDING ties. Sorting by Role.position (the rank)
+  // hid this: ranks are unique even when every role is tied on raw, so the sort
+  // looked settled and the tie-break below was dead code.
+  //
+  // The tie-break is BigInt, not localeCompare: SMALLER (older) snowflake ranks
+  // HIGHER (Role.js:230-239), and snowflakes crossed 18 -> 19 digits on 2022-07-22,
+  // so a guild holding roles from both sides of that date has mixed-length ids and
+  // a string compare puts every 19-digit id before every 18-digit one.
+  const olderFirst = (a: RawRole, b: RawRole) => (snowflake(a.id) < snowflake(b.id) ? -1 : 1)
   const roles: SpecRole[] = [...state.roles]
     .filter(r => !r.managed)
-    .sort((a, b) => b.position - a.position || a.id.localeCompare(b.id))
+    .sort((a, b) => b.rawPosition - a.rawPosition || olderFirst(a, b))
     .map(r => {
       const role: SpecRole = { name: r.name, id: r.id }
       if (r.hexColor && r.hexColor !== '#000000') role.color = r.hexColor
       if (r.hoist) role.hoist = true
       if (r.mentionable) role.mentionable = true
       role.permissions = [...r.permissions].sort()
-      role.position = r.position
+      role.position = r.rawPosition   // raw, not the rank: see SpecRole.position
       return role
     })
 
@@ -444,9 +480,21 @@ export function buildServerSpec(state: RawGuildState): ServerSpec {
 export type FieldChange = { field: string; before?: unknown; after: unknown }
 /** Converging boolean map for permissionOverwrites.edit — see overwriteEditMap. */
 export type OverwriteEdit = { id: string; type?: 'role' | 'member'; set: Record<string, boolean | null> }
+/** The whole-guild role hierarchy, before and after, plus the body that gets it there.
+ *  One entry, not one per role: it is a single PATCH that succeeds or fails whole, and
+ *  a per-role diff would imply per-role writes, which Discord does not offer. */
+export type OrderingChange = {
+  before: Array<{ id: string; name: string }>   // highest first
+  after: Array<{ id: string; name: string }>    // highest first
+  /** The complete PATCH body. Complete because a partial one is advisory. */
+  writes: Array<{ id: string; position: number }>
+  /** Roles at or above the bot's ceiling: emitted unmoved, never planned around. */
+  frozen: string[]
+}
+
 export type SpecDiffEntry = {
-  kind: 'everyone' | 'role' | 'category' | 'channel'
-  op: 'create' | 'modify' | 'rename' | 'move' | 'delete'
+  kind: 'everyone' | 'role' | 'category' | 'channel' | 'ordering'
+  op: 'create' | 'modify' | 'rename' | 'move' | 'delete' | 'reorder'
   name: string
   /** The live entity's snowflake — set on id-matched modify and on every
    *  rename/move/delete so the applier resolves targets across renames. */
@@ -456,6 +504,8 @@ export type SpecDiffEntry = {
   changes: FieldChange[]
   /** modify only: per-target overwrite edit maps for the applier. */
   overwriteEdits?: OverwriteEdit[]
+  /** ordering only. */
+  ordering?: OrderingChange
   /** Human-readable ⚠ lines for dangerous grants. */
   dangerous: string[]
 }
@@ -484,6 +534,14 @@ export type SpecDiffOptions = {
   managedRoleIds?: string[]
   /** Ids of roles the bot itself holds (its highest role). */
   botRoleIds?: string[]
+  /** EVERY live role including managed ones and @everyone, with raw positions.
+   *  Required when the spec carries above/below. ServerSpec cannot stand in for it:
+   *  buildServerSpec filters managed roles out and snapshotGuild drops @everyone,
+   *  and the planner needs both — managed roles occupy real hierarchy slots, and
+   *  @everyone is why raw 0 is not available. */
+  allRoles?: ReadonlyArray<RolePositionInput>
+  /** The bot's own highest role. Required when the spec carries above/below. */
+  botHighestRoleId?: string
 }
 
 // Large-prune banner: a diff whose delete count exceeds EITHER bound gets a
@@ -561,6 +619,7 @@ function diffOverwrites(
 
 export function specEntryLabel(e: SpecDiffEntry): string {
   if (e.kind === 'everyone') return '@everyone'
+  if (e.kind === 'ordering') return 'role hierarchy'
   if (e.kind === 'channel') return `channel "${e.category ? `${e.category} / ` : ''}#${e.name}"`
   return `${e.kind} "${e.name}"`
 }
@@ -649,12 +708,18 @@ export function computeSpecDiff(current: ServerSpec, desired: ServerSpec, opts: 
       cur = have[0]
     }
     if (!cur) {
+      if (want.position !== undefined) {
+        throw new Error(
+          `role "${want.name}": remove \`position\`. It is read-only, and on a role being CREATED it is `
+          + `not merely ignored by us — Discord's create endpoint has no position field at all, so the `
+          + `role always lands at the bottom. To place it, use above/below: `
+          + `{ "name": "${want.name}", "above": "<role name>" }.`)
+      }
       const changes: FieldChange[] = []
       if (want.color !== undefined) changes.push({ field: 'color', after: want.color })
       if (want.hoist !== undefined) changes.push({ field: 'hoist', after: want.hoist })
       if (want.mentionable !== undefined) changes.push({ field: 'mentionable', after: want.mentionable })
       if (want.permissions) changes.push({ field: 'permissions', after: [...want.permissions].sort() })
-      if (want.position !== undefined) changes.push({ field: 'position', after: want.position })
       entries.push({
         kind: 'role', op: 'create', name: want.name, changes,
         dangerous: dangerousGrants(undefined, want.permissions).map(p => `grants ${p} to new role "${want.name}"`),
@@ -674,7 +739,20 @@ export function computeSpecDiff(current: ServerSpec, desired: ServerSpec, opts: 
       if (want.permissions && !sameSet(cur.permissions, want.permissions)) {
         changes.push({ field: 'permissions', before: [...(cur.permissions ?? [])].sort(), after: [...want.permissions].sort() })
       }
-      // position intentionally not diffed — create-only (see SpecRole).
+      // position is NOT diffed, and NOT silently ignored either — both were bugs.
+      // Ignoring it made apply answer "already matches, 0 changes" to a reorder it
+      // never compared. Diffing it implied a write path that cannot exist: a raw
+      // position is advisory in a partial write and normalised in a complete one, so
+      // "set this role to 4" is not a thing the API offers. A value that MATCHES is
+      // accepted, so a round-tripped export stays the documented no-op; a value that
+      // DIFFERS is where the user meant to reorder, and that must say so out loud.
+      if (want.position !== undefined && want.position !== cur.position) {
+        throw new Error(
+          `role "${want.name}": position ${want.position} does not match its live raw position `
+          + `${cur.position}. \`position\` is read-only — it is exported so you can see the `
+          + `hierarchy, not to set it. To reorder, use above/below: `
+          + `{ "name": "${want.name}", "above": "<role name>" }. Otherwise supply it unchanged, or omit it.`)
+      }
       if (changes.length > 0) {
         entries.push({
           kind: 'role', op: 'modify', name: want.name, id: cur.id, changes,
@@ -887,13 +965,130 @@ export function computeSpecDiff(current: ServerSpec, desired: ServerSpec, opts: 
     }
   }
 
+  // ── Role hierarchy ──────────────────────────────────────────────────────────
+  // Runs LAST, against a PROJECTION of the guild as it will look once everything
+  // above has been applied — creates added, renames applied, deletes removed. A
+  // reorder computed against the guild as it is today would renumber around roles
+  // that are about to vanish and miss the ones about to appear.
+  //
+  // The result here is for the APPROVAL PROMPT. The applier re-resolves and re-plans
+  // against the real guild immediately before writing, because created roles have no
+  // snowflake yet and because an approval can sit for five minutes.
+  const ordering: SpecDiffEntry[] = []
+  const named = namedOrderingConstraints(desired)
+  if (named.length > 0) {
+    if (!opts.allRoles || !opts.botHighestRoleId || !opts.guildId) {
+      throw new Error(
+        'role ordering: above/below need the full role snapshot (allRoles, botHighestRoleId, guildId). '
+        + 'This is a caller bug — the spec asked for a reorder and the diff was given no hierarchy to reorder.')
+    }
+    const deleted = new Set(deletions.role.map(e => e.id).filter(isString))
+    const renamedTo = new Map<string, string>()
+    for (const e of [...entries, ...renames]) {
+      if (e.kind === 'role' && e.op === 'rename' && e.id) renamedTo.set(e.id, e.name)
+    }
+    // A role this spec CREATES has no snowflake yet. Discord lands new roles at the
+    // tied bottom, and a tie breaks by id with the newest lowest — so a synthetic id
+    // at the top of the snowflake range puts the projection's new roles exactly where
+    // the real ones will land. These ids never reach Discord; the applier re-plans.
+    // ASCENDING, because Discord assigns ascending snowflakes and the tie-break ranks the smaller id
+    // HIGHER -- so the first role created really does land above the second. Decrementing here put
+    // them in the projection backwards, and a spec whose two new roles constrain each other then
+    // looked already-satisfied: no ordering entry emitted, apply reports success, spec unsatisfied.
+    let synth = BigInt('9'.repeat(18) + '0')   // still far above any real snowflake (~1.5e18)
+    const projected: RolePositionInput[] = [
+      ...opts.allRoles
+        .filter(r => !deleted.has(r.id))
+        .map(r => ({ ...r, name: renamedTo.get(r.id) ?? r.name })),
+      ...entries
+        .filter(e => e.kind === 'role' && e.op === 'create')
+        .map(e => ({ id: String(synth++), name: e.name, rawPosition: 1, managed: false })),
+    ]
+    const nameOf = (id: string) => projected.find(r => r.id === id)?.name ?? id
+    const plan = planRolePositions(
+      projected,
+      resolveOrderingConstraints(projected, named),
+      { botHighestRoleId: opts.botHighestRoleId, everyoneRoleId: opts.guildId },
+    )
+    if ('refusal' in plan) throw new Error(explainOrderingRefusal(plan.refusal, nameOf))
+    if (plan.writes.length > 0) {
+      const before = hierarchyOrder(projected).map(r => ({ id: r.id, name: r.name }))
+      const after = [...plan.writes]
+        .sort((a, b) => b.position - a.position)
+        .map(w => ({ id: w.id, name: nameOf(w.id) }))
+      ordering.push({
+        kind: 'ordering', op: 'reorder', name: 'role hierarchy', changes: [],
+        ordering: { before, after, writes: plan.writes, frozen: plan.frozen },
+        dangerous: dangerousReorder(after, before, desired, current),
+      })
+    }
+  }
+
   return {
     // Apply order: creates/updates, then renames/moves, then deletes —
-    // child channels before their (now-empty) categories, roles last.
-    entries: [...entries, ...renames, ...deletions.channel, ...deletions.category, ...deletions.role],
+    // child channels before their (now-empty) categories, roles last — and the
+    // hierarchy reorder after ALL of them, or it renumbers around roles that are
+    // about to be deleted and cannot see the ones about to be created.
+    entries: [...entries, ...renames, ...deletions.channel, ...deletions.category, ...deletions.role, ...ordering],
     untouched,
     channelCount: currentCats.length + currentChans.length,
   }
+}
+
+/**
+ * Who actually MOVED, and past whom.
+ *
+ * Counting roles whose index changed overstates it badly: inserting one role between two others shifts
+ * every role below it by one, so "1 role moved" reads as "4 roles change rank". §2.2 of the plan is
+ * about exactly this — an approval prompt that overstates its blast radius trains the reader to ignore
+ * it, which is the same failure as understating it. What a human sees is who now outranks whom, so
+ * that is what gets reported: the pairs that actually FLIPPED.
+ */
+export function orderingCrossings(
+  before: ReadonlyArray<{ id: string; name: string }>,
+  after: ReadonlyArray<{ id: string; name: string }>,
+): Array<{ id: string; name: string; passed: string[] }> {
+  const rankBefore = new Map(before.map((r, i) => [r.id, i]))
+  const out: Array<{ id: string; name: string; passed: string[] }> = []
+  after.forEach((r, i) => {
+    const was = rankBefore.get(r.id)
+    if (was === undefined) return
+    // Roles this one now outranks that it did not before.
+    const passed = after.slice(i + 1)
+      .filter(o => { const ow = rankBefore.get(o.id); return ow !== undefined && ow < was })
+      .map(o => o.name)
+    if (passed.length > 0) out.push({ id: r.id, name: r.name, passed })
+  })
+  return out
+}
+
+/** ⚠ lines for a reorder: a role gaining rank over a role that holds a dangerous
+ *  permission is a privilege change, and belongs in the same place dangerousGrants
+ *  puts one. Rank alone does not grant anything, but it decides who can moderate whom
+ *  and which roles this bot can still touch afterwards. */
+function dangerousReorder(
+  after: ReadonlyArray<{ id: string; name: string }>,
+  before: ReadonlyArray<{ id: string; name: string }>,
+  desired: ServerSpec,
+  current: ServerSpec,
+): string[] {
+  // LIVE permissions first, spec on top. Reading only the spec made this silent in the common case:
+  // apply_server_spec is additive, so a partial spec -- the shape the tool description itself
+  // advertises, {name:"Owner", above:"Moderator"} -- restates nobody's permissions, every role reads
+  // as harmless, and the approval DM shows no warning while a role is lifted over an Administrator
+  // holder. The live permissions were in `current` the whole time and were never consulted.
+  const permsOf = new Map((current.roles ?? []).map(r => [r.name, r.permissions ?? []]))
+  for (const r of desired.roles ?? []) if (r.permissions) permsOf.set(r.name, r.permissions)
+  const risky = (name: string) => (permsOf.get(name) ?? []).some(p => DANGEROUS_PERMS.includes(p))
+  const out: string[] = []
+  for (const c of orderingCrossings(before, after)) {
+    for (const passedName of c.passed) {
+      if (risky(passedName)) {
+        out.push(`"${c.name}" now ranks above "${passedName}", which holds a dangerous permission`)
+      }
+    }
+  }
+  return out
 }
 
 function fmtVal(v: unknown): string {
@@ -913,12 +1108,13 @@ export function renderSpecDiff(diff: SpecDiff): string {
   const dels = count('delete')
   const renamesMoves = count('rename') + count('move')
   let header = `${diff.entries.length} change(s)`
-  if (dels > 0 || renamesMoves > 0) {
+  if (dels > 0 || renamesMoves > 0 || count('reorder') > 0) {
     const parts: string[] = []
     if (dels > 0) parts.push(`⚠ ${dels} DELETION${dels === 1 ? '' : 'S'}`)
     if (count('create') > 0) parts.push(`${count('create')} create${count('create') === 1 ? '' : 's'}`)
     if (renamesMoves > 0) parts.push(`${renamesMoves} rename${renamesMoves === 1 ? '' : 's'}/move${renamesMoves === 1 ? '' : 's'}`)
     if (count('modify') > 0) parts.push(`${count('modify')} update${count('modify') === 1 ? '' : 's'}`)
+    if (count('reorder') > 0) parts.push('1 hierarchy reorder')
     header += ` — ${parts.join(' · ')}`
   }
   if (dangerCount > 0) header += ` — ⚠ ${dangerCount} with dangerous grants`
@@ -940,6 +1136,29 @@ export function renderSpecDiff(diff: SpecDiff): string {
     if (e.op === 'move') {
       const c = e.changes.find(x => x.field === 'category')
       lines.push(`~ move channel "#${e.name}": ${fmtVal(c?.before)} → ${fmtVal(c?.after)}`)
+      continue
+    }
+    if (e.kind === 'ordering') {
+      const o = e.ordering
+      if (!o) { lines.push('~ role hierarchy (no detail recorded)'); continue }
+      const crossings = orderingCrossings(o.before, o.after)
+      const movedIds = new Set(crossings.map(c => c.id))
+      lines.push(crossings.length === 0
+        ? '~ reorder role hierarchy — renumbering only, nobody changes rank:'
+        : `~ reorder role hierarchy — ${crossings.map(c => `"${c.name}" moves above ${c.passed.map(n => `"${n}"`).join(', ')}`).join('; ')}:`)
+      // Full table, highest first, both columns. This block goes in the ATTACHMENT;
+      // the DM body gets a bounded summary, because it is hard-capped at 1900 chars
+      // and a full ordering would be silently truncated exactly where it matters.
+      const width = Math.max(...o.before.map(r => r.name.length), 6)
+      for (let i = 0; i < Math.max(o.before.length, o.after.length); i++) {
+        const b = o.before[i], a = o.after[i]
+        const mark = a && movedIds.has(a.id) ? '←' : ' '
+        lines.push(`    ${(b?.name ?? '').padEnd(width)}  →  ${a?.name ?? ''} ${mark}`)
+      }
+      if (o.frozen.length > 0) {
+        lines.push(`    (${o.frozen.length} role(s) at or above this bot's own role cannot be moved and were left alone)`)
+      }
+      for (const d of e.dangerous) lines.push(`  ⚠ ${d}`)
       continue
     }
     const parts = e.changes.map(c =>
@@ -1117,4 +1336,327 @@ export function lookupNameMatches(name: string | null | undefined, q: string): b
  *  Deliberately NOT ranked by channel type -- see the comment on lookupRank in server.ts. */
 export function lookupRank(name: string, q: string): number {
   return name.normalize('NFKD').toLowerCase() === q ? 0 : 1
+}
+
+// ── Role ordering ─────────────────────────────────────────────────────────────
+// Everything here is pure. The applier hands in a snapshot and gets back either a
+// complete PATCH body or a refusal that names what blocked it.
+//
+// The measurements this is built on (LSS, 2026-08-27, REST v10):
+//  - A COMPLETE ordering with distinct positions is honoured verbatim, and sending
+//    the same body twice is a genuine no-op.
+//  - A PARTIAL write is ADVISORY: one entry asking for position 3 landed at 2,
+//    because 2 was the free slot. There is no model of that here because we never
+//    send one.
+//  - A complete ordering containing a GAP is densified (asked 0,2,3,4,5,6 -> got
+//    0..5), so gaps cannot be preserved and must not be reported as our doing.
+//  - The hierarchy gate is on BOTH ends: a role below the bot cannot be lifted
+//    above it, and a role above the bot cannot be moved at all.
+
+export type RolePositionInput = { id: string; name: string; rawPosition: number; managed: boolean }
+
+/** Roles a spec CREATES have no snowflake at diff time, so the projection gives them placeholders far
+ *  above any real id (Discord's reach 9e18 around 2090). The applier needs to tell them apart when it
+ *  compares what the owner approved against what it is about to write. */
+const SYNTHETIC_ID_FLOOR = BigInt('9' + '0'.repeat(18))
+export function isSyntheticRoleId(id: string): boolean {
+  return snowflake(id) >= SYNTHETIC_ID_FLOOR
+}
+
+/** A role id as a BigInt for ordering. Real Discord ids are always numeric, but a bare `BigInt(id)`
+ *  THROWS on anything else and would take the whole diff down over one malformed entry — so a
+ *  non-numeric id sorts last rather than crashing. */
+function snowflake(id: string): bigint {
+  try { return BigInt(id) } catch { return SYNTHETIC_ID_FLOOR * 10n }
+}
+
+/** A relational ordering statement. `above` / `below` hold role IDS, not names —
+ *  name resolution happens upstream, against the post-create/post-rename snapshot. */
+export type RoleConstraint = { id: string; above?: string[]; below?: string[] }
+
+export type RolePositionRefusal =
+  | { kind: 'unknown-role'; ids: string[] }
+  | { kind: 'frozen'; blockingRoleIds: string[]; ceiling: number }
+  | { kind: 'contradiction'; roleIds: string[] }
+  | { kind: 'cycle'; roleIds: string[] }
+
+export type RolePositionPlan =
+  | { writes: Array<{ id: string; position: number }>; frozen: string[] }
+  | { refusal: RolePositionRefusal }
+
+/** Discord's own hierarchy order, highest first: raw position descending, ties broken
+ *  by snowflake with the OLDER (smaller) id ranking higher (Role.js:230-239). */
+function hierarchyOrder(roles: ReadonlyArray<RolePositionInput>): RolePositionInput[] {
+  return [...roles].sort((a, b) => b.rawPosition - a.rawPosition || (snowflake(a.id) < snowflake(b.id) ? -1 : 1))
+}
+
+/**
+ * Resolve relational ordering constraints into a complete PATCH body.
+ *
+ * Returns `writes: []` when the live order already satisfies everything — that is a
+ * real outcome, not an empty failure, and it is why the toposort below is stable
+ * against the current order rather than picking any valid topological order.
+ */
+export function planRolePositions(
+  roles: ReadonlyArray<RolePositionInput>,
+  constraints: ReadonlyArray<RoleConstraint>,
+  ctx: { botHighestRoleId: string; everyoneRoleId: string },
+): RolePositionPlan {
+  const byId = new Map(roles.map(r => [r.id, r]))
+  const order = hierarchyOrder(roles)
+  const rankOf = new Map(order.map((r, i) => [r.id, i]))   // 0 = highest
+
+  // Unknown ids first: everything below reads these maps, and a missing id there
+  // would surface as a confusing downstream refusal instead of the real cause.
+  const referenced = new Set<string>()
+  for (const c of constraints) {
+    referenced.add(c.id)
+    for (const id of c.above ?? []) referenced.add(id)
+    for (const id of c.below ?? []) referenced.add(id)
+  }
+  const unknown = new Set([...referenced].filter(id => !byId.has(id)))
+  if (!byId.has(ctx.botHighestRoleId)) unknown.add(ctx.botHighestRoleId)
+  if (!byId.has(ctx.everyoneRoleId)) unknown.add(ctx.everyoneRoleId)
+  if (unknown.size > 0) return { refusal: { kind: 'unknown-role', ids: [...unknown] } }
+
+  // FROZEN: at or above the bot's own highest role, plus @everyone, which is pinned
+  // to raw 0 by Discord and is not a role anything can be placed below.
+  const ceilingRank = rankOf.get(ctx.botHighestRoleId)!
+  const isFrozen = (id: string) => rankOf.get(id)! <= ceilingRank || id === ctx.everyoneRoleId
+  const frozen = order.filter(r => isFrozen(r.id)).map(r => r.id)
+
+  const blocked = [...referenced].filter(isFrozen)
+  if (blocked.length > 0) {
+    return {
+      refusal: {
+        kind: 'frozen',
+        blockingRoleIds: blocked,
+        ceiling: byId.get(ctx.botHighestRoleId)!.rawPosition,
+      },
+    }
+  }
+
+  // A single statement naming the same role on both sides is a contradiction we can
+  // report precisely; leaving it to the cycle detector would report it as a cycle
+  // and name a path instead of the sentence that is wrong.
+  const contradictions: string[] = []
+  for (const c of constraints) {
+    const above = new Set(c.above ?? [])
+    for (const id of c.below ?? []) if (above.has(id) || id === c.id) contradictions.push(id)
+    if (above.has(c.id)) contradictions.push(c.id)
+  }
+  if (contradictions.length > 0) {
+    return { refusal: { kind: 'contradiction', roleIds: [...new Set(contradictions)] } }
+  }
+
+  // Edge hi -> lo means "hi ranks above lo".
+  const movable = order.filter(r => !isFrozen(r.id))
+  const movableSet = new Set(movable.map(r => r.id))
+  const out = new Map<string, Set<string>>(movable.map(r => [r.id, new Set<string>()]))
+  const indegree = new Map<string, number>(movable.map(r => [r.id, 0]))
+  const addEdge = (hi: string, lo: string) => {
+    if (!movableSet.has(hi) || !movableSet.has(lo)) return
+    if (out.get(hi)!.has(lo)) return
+    out.get(hi)!.add(lo)
+    indegree.set(lo, indegree.get(lo)! + 1)
+  }
+  for (const c of constraints) {
+    for (const lo of c.above ?? []) addEdge(c.id, lo)
+    for (const hi of c.below ?? []) addEdge(hi, c.id)
+  }
+
+  // Cycle detection, by topological sort over the movable set.
+  const ready = movable.filter(r => indegree.get(r.id) === 0).map(r => r.id)
+  const pending = new Map(indegree)
+  const topo: string[] = []
+  while (ready.length > 0) {
+    ready.sort((a, b) => rankOf.get(a)! - rankOf.get(b)!)
+    const next = ready.shift()!
+    topo.push(next)
+    for (const lo of out.get(next)!) {
+      const d = pending.get(lo)! - 1
+      pending.set(lo, d)
+      if (d === 0) ready.push(lo)
+    }
+  }
+  if (topo.length !== movable.length) {
+    // Kahn leaves behind the cycle AND everything downstream of it. Naming the lot tells the owner
+    // that roles with no cyclic clause at all "form a cycle", which is a confident wrong sentence in
+    // the one place the whole design exists to be legible (Discord's own answer here is a bare 50013).
+    // A role is in a cycle iff it can reach itself.
+    const placed = new Set(topo)
+    const stuck = movable.filter(r => !placed.has(r.id)).map(r => r.id)
+    const reaches = (from: string, target: string) => {
+      const seen = new Set<string>(); const queue = [...(out.get(from) ?? [])]
+      while (queue.length > 0) {
+        const n = queue.shift()!
+        if (n === target) return true
+        if (seen.has(n)) continue
+        seen.add(n)
+        queue.push(...(out.get(n) ?? []))
+      }
+      return false
+    }
+    const inCycle = stuck.filter(id => reaches(id, id))
+    return { refusal: { kind: 'cycle', roleIds: inCycle.length > 0 ? inCycle : stuck } }
+  }
+
+  // REPAIR the live order rather than rebuilding it from the constraint graph.
+  //
+  // Rebuilding is where the obvious implementation goes wrong: a topological sort emits a role only
+  // once every role that must sit above it has been emitted, so "put Lodestone above Owner" sinks
+  // Owner from the top of the guild to the bottom -- a valid ordering, and a wild answer to the
+  // question asked. So the live order is repaired in place instead: find a violated clause, move that
+  // clause's SUBJECT the minimum distance that satisfies all of its own clauses, repeat.
+  //
+  // Then VERIFY, and fall back to the topological order if the repair did not converge. That is not
+  // belt-and-braces, it is load-bearing: the first version of this lifted the subjects OUT of the list
+  // and re-inserted them, so a clause naming another subject read `indexOf(...) === -1` and was
+  // silently DISCARDED. On VoX's own request -- "Owner above Bot, Bot above Moderator" -- it produced
+  // Owner BELOW Moderator, the exact inverse, and reported success. A property test over 5000 random
+  // guilds put that at 212 silently-violated orderings, 44 of which returned "nothing to do".
+  // Verification is what makes a wrong answer impossible rather than merely unlikely.
+  const idx = (list: string[], id: string) => list.indexOf(id)
+  const clausesOf = (id: string) => constraints.filter(c => c.id === id)
+  /** The first clause not satisfied by `list`, scanning constraints in order for determinism. */
+  const firstViolation = (list: string[]): string | null => {
+    for (const c of constraints) {
+      if (!movableSet.has(c.id)) continue
+      const me = idx(list, c.id)
+      for (const other of c.above ?? []) if (movableSet.has(other) && me >= idx(list, other)) return c.id
+      for (const other of c.below ?? []) if (movableSet.has(other) && me <= idx(list, other)) return c.id
+    }
+    return null
+  }
+
+  let working = movable.map(r => r.id)
+  // Bounded: each pass fixes one subject and may disturb another, so cap the churn and let the
+  // verification below decide whether the result is usable rather than trusting the loop to settle.
+  const maxPasses = movable.length * Math.max(1, constraints.length) * 2 + 16
+  for (let pass = 0; pass < maxPasses; pass++) {
+    const subject = firstViolation(working)
+    if (subject === null) break
+    const without = working.filter(id => id !== subject)
+    // Window against the FULL remaining order -- every other role is on the board, which is precisely
+    // what the lift-them-all-out version could not say.
+    let lo = 0, hi = without.length
+    for (const c of clausesOf(subject)) {
+      for (const other of c.above ?? []) { const i = idx(without, other); if (i >= 0) hi = Math.min(hi, i) }
+      for (const other of c.below ?? []) { const i = idx(without, other); if (i >= 0) lo = Math.max(lo, i + 1) }
+    }
+    if (lo > hi) break   // not placeable against the others as they stand; the verification below decides
+    const natural = Math.min(idx(working, subject), without.length)
+    without.splice(Math.max(lo, Math.min(hi, natural)), 0, subject)
+    working = without
+  }
+
+  // The repair is an OPTIMISATION -- it minimises how far things move. Correctness comes from here.
+  // `topo` satisfies every constraint by construction (the cycle check above proved the graph acyclic),
+  // so a repair that failed to converge costs a tidier answer, never a wrong one.
+  if (firstViolation(working) !== null) working = topo
+  const placedOrder = working
+
+  // Frozen roles keep their live order at the top and are still EMITTED: the body has
+  // to be complete for Discord to honour it verbatim, but nothing is asked to move,
+  // so no role above the ceiling is ever the subject of a write.
+  const finalOrder = [
+    ...order.filter(r => isFrozen(r.id) && r.id !== ctx.everyoneRoleId).map(r => r.id),
+    ...placedOrder,
+    ctx.everyoneRoleId,
+  ]
+
+  const liveOrder = order.map(r => r.id)
+  if (finalOrder.length === liveOrder.length && finalOrder.every((id, i) => id === liveOrder[i])) {
+    return { writes: [], frozen }
+  }
+
+  // Frozen roles keep the EXACT raw they hold now; the movable ones are packed contiguously in the
+  // space below the lowest of them, with @everyone pinned at 0 where Discord pins it anyway. Simply
+  // numbering everything contiguously is tempting -- Discord densifies a complete body regardless
+  // (M11), so the numbers do not survive -- but it makes the body ASK a role above the ceiling to
+  // take a different position, and the only thing measured about that is that MOVING one is 50013.
+  // Ask for nothing we have not been told we may have.
+  const frozenSet = new Set(frozen)
+  const lowestFrozenRaw = Math.min(
+    ...frozen.filter(id => id !== ctx.everyoneRoleId).map(id => byId.get(id)!.rawPosition),
+    Number.POSITIVE_INFINITY,
+  )
+  const movableIds = finalOrder.filter(id => !frozenSet.has(id))
+  const fits = movableIds.length < lowestFrozenRaw
+  const writes = finalOrder.map((id, i) => {
+    if (id === ctx.everyoneRoleId) return { id, position: 0 }
+    if (frozenSet.has(id) && fits) return { id, position: byId.get(id)!.rawPosition }
+    if (fits) return { id, position: movableIds.length - movableIds.indexOf(id) }
+    return { id, position: finalOrder.length - 1 - i }   // no room to preserve: contiguous, ranks intact
+  })
+  return { writes, frozen }
+}
+
+/** One `above`/`below` clause, before names have been resolved to snowflakes. */
+export type NamedConstraint = { subject: string; above: string[]; below: string[] }
+
+/** Pull the relational ordering clauses out of a spec. Empty when the spec carries none,
+ *  which is the common case and means no reorder entry is produced at all. */
+export function namedOrderingConstraints(desired: ServerSpec): NamedConstraint[] {
+  const arr = (v: string | string[] | undefined) => (v === undefined ? [] : Array.isArray(v) ? v : [v])
+  return (desired.roles ?? [])
+    .map(r => ({ subject: r.name, above: arr(r.above), below: arr(r.below) }))
+    .filter(c => c.above.length > 0 || c.below.length > 0)
+}
+
+/**
+ * Resolve ordering clauses against a role set, by name.
+ *
+ * `roles` must carry the names as they will exist when the reorder runs — after this
+ * spec's creates and renames. That is the whole reason this is a separate step rather
+ * than something computeSpecDiff does inline: a spec that renames Moderator to "op"
+ * AND says `above: "Moderator"` must fail, because post-rename there is no Moderator,
+ * and quietly matching the pre-rename name would reorder around a role that no longer
+ * has that identity.
+ *
+ * Throws on a name matching zero or more than one role — the failure mode being fixed
+ * here is silent misresolution, so this must never guess.
+ */
+export function resolveOrderingConstraints(
+  roles: ReadonlyArray<RolePositionInput>,
+  named: ReadonlyArray<NamedConstraint>,
+): RoleConstraint[] {
+  const byName = new Map<string, string[]>()
+  for (const r of roles) byName.set(r.name, [...(byName.get(r.name) ?? []), r.id])
+  const resolve = (name: string, ctx: string): string => {
+    const hits = byName.get(name) ?? []
+    if (hits.length === 1) return hits[0]!
+    if (hits.length === 0) {
+      throw new Error(
+        `role ordering (${ctx}): no role named "${name}" will exist after this spec is applied. `
+        + `above/below name roles by their FINAL name — if the spec renames it, use the new name.`)
+    }
+    throw new Error(
+      `role ordering (${ctx}): "${name}" is ambiguous — ${hits.length} roles share that name. `
+      + `Rename one, or reorder these by hand.`)
+  }
+  return named.map(c => ({
+    id: resolve(c.subject, `subject "${c.subject}"`),
+    above: c.above.map(n => resolve(n, `"${c.subject}" above "${n}"`)),
+    below: c.below.map(n => resolve(n, `"${c.subject}" below "${n}"`)),
+  }))
+}
+
+/** Turn a planner refusal into the sentence the owner sees. Discord's own answer to all
+ *  of these is a bare 50013 that names nothing. */
+export function explainOrderingRefusal(r: RolePositionRefusal, nameOf: (id: string) => string): string {
+  switch (r.kind) {
+    case 'unknown-role':
+      return `role ordering: ${r.ids.length} role id(s) in the plan are not in this guild (${r.ids.join(', ')})`
+    case 'frozen':
+      return `role ordering: ${r.blockingRoleIds.map(id => `"${nameOf(id)}"`).join(', ')} `
+        + `${r.blockingRoleIds.length === 1 ? 'sits' : 'sit'} at or above this bot's own highest role `
+        + `(raw position ${r.ceiling}). Discord only lets a bot move roles strictly below its own, on `
+        + `BOTH ends of the move — raise the bot's role above the ones it must order, or reorder by hand.`
+    case 'contradiction':
+      return `role ordering: the clauses for ${r.roleIds.map(id => `"${nameOf(id)}"`).join(', ')} cannot all hold at once`
+    case 'cycle':
+      return `role ordering: ${r.roleIds.map(id => `"${nameOf(id)}"`).join(' → ')} form a cycle — `
+        + `each is required to sit above the next`
+  }
 }

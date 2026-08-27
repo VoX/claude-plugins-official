@@ -101,8 +101,8 @@ Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mo
 | `fetch_messages` | Pull recent history from a channel (oldest-first). Capped at 100 per call. Each line includes the message ID so the model can `reply_to` it; messages with attachments are marked `+Natt`. Discord's search API isn't exposed to bots, so this is the only lookback. |
 | `download_attachment` | Download all attachments from a specific message by ID to `~/.claude/channels/discord/inbox/`. Optional `dest_dir` copies files to a target directory. Returns file paths + metadata. Use when `fetch_messages` shows a message has attachments. |
 | `lookup` | Resolve a channel or user **name** to its snowflake ID. Takes `query` (leading `#`/`@` stripped, case-insensitive substring), optional `kind` (`channel`/`user`/`both`), `guild_id` to narrow, `limit` (default 10, max 50). Exact name matches sort first. Needs **no permissions beyond the bridge's own** — channels come from the `Guilds` intent cache (which only ever contained channels the bot can see), and users are matched against the message cache first, falling back to Discord's member-search endpoint only when that misses. Finding a channel is **not** permission to post in it; the access allowlist still decides that. |
-| `get_server_spec` | Read a guild's structure as a spec object: `everyone_permissions`, roles (name/color/hoist/mentionable/permissions/position), categories with their channels (name/kind/topic/slowmode/nsfw/overwrites), plus a `bot` section (this bot's highest role position and which admin permissions it holds). Every entry carries its snowflake `id` for `apply_server_spec`'s rename/move matching. Read-only; output is exactly what `apply_server_spec` consumes. |
-| `apply_server_spec` | Apply a server spec to a guild — additive upsert (create/update only, **never deletes** by default). Entries that keep their `id` are renamed/moved in place instead of recreated. `prune: true` turns the apply into a full reconcile that deletes unclaimed entities (never `@everyone`, managed roles, or the bot's own role). Renders a diff and DMs it to `DISCORD_OWNER_ID` with Allow/Deny buttons; blocks until they decide (5-min timeout = deny). `dry_run: true` returns the diff without approval or changes. See [Server admin tools](#server-admin-tools). |
+| `get_server_spec` | Read a guild's structure as a spec object: `everyone_permissions`, roles (name/color/hoist/mentionable/permissions/position — read-only), categories with their channels (name/kind/topic/slowmode/nsfw/overwrites), plus a `bot` section (its highest role, that role's raw position, the roles out of its reach, and which admin permissions it holds). Every entry carries its snowflake `id` for `apply_server_spec`'s rename/move matching. Read-only; output is exactly what `apply_server_spec` consumes. |
+| `apply_server_spec` | Apply a server spec to a guild — additive upsert (create/update only, **never deletes** by default). Entries that keep their `id` are renamed/moved in place instead of recreated. `prune: true` turns the apply into a full reconcile that deletes unclaimed entities (never `@everyone`, managed roles, or the bot's own role). Renders a diff and DMs it to `DISCORD_OWNER_ID` with Allow/Deny buttons; blocks until they decide (5-min timeout = deny). `dry_run: true` returns the diff without approval or changes. Role order is set relationally with `above`/`below`. See [Server admin tools](#server-admin-tools). |
 
 The `typing` tool lets the assistant show a typing indicator manually —
 the bot does not auto-type on every inbound message (that made it look
@@ -160,8 +160,26 @@ Channel `kind` is `text` / `voice` / `announcement` / `forum` / `stage`.
 Overwrite targets are `"@everyone"`, `"role:<Name>"`, or a raw snowflake with
 `type: "role" | "member"`. Permission names are discord.js `PermissionFlagsBits`
 keys (`ViewChannel`, `ManageMessages`, …); colors are hex or discord.js color
-names. Role `position` applies on create only — existing roles are never
-reordered.
+names.
+
+**Role hierarchy.** Set order with `above` / `below` on a role — a name or a list
+of names: `{ "name": "Owner", "above": "Moderator" }`. They refer to names as they
+will be *after* this spec's creates and renames, so a spec that renames `Moderator`
+to `op` must say `above: "op"`; an unresolvable or ambiguous name is an error rather
+than a silent skip.
+
+Role `position` is **read-only**. It is exported so you can see the hierarchy — and
+it is the raw value Discord stores, so roles can and do tie on it. Supply it
+unchanged (a round-tripped export stays a no-op) or leave it out; a *different*
+value is an error pointing you at `above`/`below`. It is not a unit you could
+reorder in even if it were writable: Discord treats a position in a partial write
+as advisory (ask for 3, get 2 if 2 is the free slot) and renumbers the whole guild
+to contiguous values on a complete one.
+
+A reorder is **one all-or-nothing write**, applied after every other change in the
+spec, and the bot can only move roles strictly below its own highest role — on both
+ends of the move. `get_server_spec`'s `bot.roles_out_of_reach` lists the ones it
+cannot touch.
 
 **Additive semantics.** `apply_server_spec` diffs the spec against the live
 guild and upserts: missing things are created, drifted spec-set fields are
