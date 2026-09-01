@@ -488,7 +488,12 @@ function defaultAccess(): Access {
 }
 
 const MAX_CHUNK_LIMIT = 2000
-const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+// Inbound and outbound caps are NOT the same thing and used to share one constant, which read like
+// an API rule and was not one. DOWNLOAD is a plain https GET of a cdn.discordapp.com URL — Discord
+// imposes nothing, so this is purely a guard on what we will pull into the inbox. UPLOAD is a real
+// Discord limit and is boost-tier dependent, so it stays conservative.
+const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 // Sanity cap for `bulk_reply` fanout. Not a Discord limit — Discord's per-bucket
 // rate limit is keyed by channel so parallel sends to N distinct channels share
@@ -812,16 +817,16 @@ async function downloadAttachment(att: Attachment): Promise<string> {
   // att.size is uploader metadata — check it first to reject oversized
   // uploads before we even fetch, but don't trust it: cap the actual
   // buffer length too so a spoofed-size upload can't blow up the inbox.
-  if (att.size > MAX_ATTACHMENT_BYTES) {
-    throw new Error(`attachment too large: ${(att.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB`)
+  if (att.size > MAX_DOWNLOAD_BYTES) {
+    throw new Error(`attachment too large: ${(att.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_DOWNLOAD_BYTES / 1024 / 1024}MB`)
   }
   const res = await fetch(att.url)
   if (!res.ok) {
     throw new Error(`attachment fetch failed: ${res.status} ${res.statusText} (${att.url})`)
   }
   let buf: Buffer<ArrayBufferLike> = Buffer.from(await res.arrayBuffer())
-  if (buf.length > MAX_ATTACHMENT_BYTES) {
-    throw new Error(`attachment body too large: ${(buf.length / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB`)
+  if (buf.length > MAX_DOWNLOAD_BYTES) {
+    throw new Error(`attachment body too large: ${(buf.length / 1024 / 1024).toFixed(1)}MB, max ${MAX_DOWNLOAD_BYTES / 1024 / 1024}MB`)
   }
   buf = await maybeDownscaleImage(buf, att.contentType)
   const name = att.name ?? `${att.id}`
@@ -1611,8 +1616,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         for (const f of files) {
           assertSendable(f)
           const st = statSync(f)
-          if (st.size > MAX_ATTACHMENT_BYTES) {
-            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 25MB)`)
+          if (st.size > MAX_UPLOAD_BYTES) {
+            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_UPLOAD_BYTES / 1024 / 1024}MB)`)
           }
         }
         if (files.length > 10) throw new Error('Discord allows max 10 attachments per message')
@@ -2015,8 +2020,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         await openSendable(chatId)   // access check; throws if this channel is not sendable
         assertSendable(filePath)
         const st = statSync(filePath)
-        if (st.size > MAX_ATTACHMENT_BYTES) {
-          throw new Error(`file too large: ${filePath} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 25MB)`)
+        if (st.size > MAX_UPLOAD_BYTES) {
+          throw new Error(`file too large: ${filePath} (${(st.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_UPLOAD_BYTES / 1024 / 1024}MB)`)
         }
 
         // Read raw audio bytes and compute a simple waveform (256 samples, RMS amplitude per chunk)
