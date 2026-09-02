@@ -64,8 +64,12 @@ With the default `requireMention: true`, the bot responds only when @mentioned o
 needed. It is **owner-only**: the handler compares the invoking user against
 `DISCORD_OWNER_ID` (set it in `~/.claude/channels/discord/.env`) and refuses
 everyone else, including allowlisted users. With `DISCORD_OWNER_ID` unset the
-command refuses everyone (fail-closed). The command registers with
-`default_member_permissions: "0"`, so Discord also hides it from non-admins.
+command refuses everyone (fail-closed). As of 0.8.2 the command registers with
+**no** `default_member_permissions` and no `dm_permission`, so Discord shows it
+to everyone everywhere — the handler is the only gate, and it is the only gate
+that ever mattered. It was previously registered with `default_member_permissions: "0"`,
+which hid it from non-admins and therefore hid it from the owner himself on any
+guild he does not administer.
 
 | Usage | Effect |
 | --- | --- |

@@ -3725,11 +3725,21 @@ const SLASH_COMMANDS = [
       { type: 5, name: 'allow_mentions', description: 'Still forward messages that @mention the bot', required: false },
     ] },
   { name: 'dedunk',  description: 'Re-enable message forwarding for this channel', type: 1 },
-  // default_member_permissions "0" hides /access from everyone but server
-  // admins in the Discord UI; the handler still enforces the real gate
-  // (DISCORD_OWNER_ID) — UI visibility is not authorization.
+  // /access is visible to everyone and authorized to nobody but the owner. It previously carried
+  // default_member_permissions "0", which hides a command from anyone without Administrator in that
+  // guild — and that broke the actual use case: the owner is a plain member on servers he does not
+  // run, so the command vanished from his picker on exactly the guilds he needed it on (VoX,
+  // 2026-09-02). dm_permission:false was the same trap one axis over, hiding it in DMs.
+  // Both are removed deliberately. UI visibility was never the authorization boundary — the handler
+  // gates on DISCORD_OWNER_ID and denies everyone else regardless of who can see the command, and it
+  // fails CLOSED (unset/empty owner id denies everybody).
+  // NOTE for whoever touches /login below: it still carries default_member_permissions "0" and has the
+  // SAME latent problem — it is the recovery command for a logged-out bot, so it goes invisible on
+  // precisely the guilds the owner does not administer, at precisely the moment it is needed. Its own
+  // comment only ever claimed visible-but-denied *in DMs*, where the field has no effect anyway. Left
+  // as-is here because this change was scoped to /access; fix it deliberately, not by assuming the two
+  // are already consistent.
   { name: 'access',  description: 'Owner-only: manage which channels + users this bot listens to', type: 1,
-    default_member_permissions: '0', dm_permission: false,
     options: [
       { type: 3, name: 'action', description: 'What to do', required: true,
         choices: [
