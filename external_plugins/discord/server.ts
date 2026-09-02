@@ -3733,12 +3733,9 @@ const SLASH_COMMANDS = [
   // Both are removed deliberately. UI visibility was never the authorization boundary — the handler
   // gates on DISCORD_OWNER_ID and denies everyone else regardless of who can see the command, and it
   // fails CLOSED (unset/empty owner id denies everybody).
-  // NOTE for whoever touches /login below: it still carries default_member_permissions "0" and has the
-  // SAME latent problem — it is the recovery command for a logged-out bot, so it goes invisible on
-  // precisely the guilds the owner does not administer, at precisely the moment it is needed. Its own
-  // comment only ever claimed visible-but-denied *in DMs*, where the field has no effect anyway. Left
-  // as-is here because this change was scoped to /access; fix it deliberately, not by assuming the two
-  // are already consistent.
+  // /login below lost the same flag in 0.8.3 for the same reason. Both handlers gate identically:
+  // the owner check is the first statement, before any option read or defer, and denies when
+  // DISCORD_OWNER_ID is unset or empty.
   { name: 'access',  description: 'Owner-only: manage which channels + users this bot listens to', type: 1,
     options: [
       { type: 3, name: 'action', description: 'What to do', required: true,
@@ -3757,12 +3754,16 @@ const SLASH_COMMANDS = [
   // why /status can still answer "Login expired · Please run /login" (VoX, 2026-07-27).
   // The code is a command OPTION, not a chat message: it travels in the interaction payload,
   // so an authorization code never lands in a channel and there is nothing to delete afterwards.
-  // dm_permission is deliberately NOT false (unlike /access): re-authenticating in a DM is the
-  // private, sensible place to do it, and default_member_permissions has no effect in DMs anyway.
-  // Non-owners can therefore SEE it in a DM -- the handler denies them, and UI visibility was never
-  // the authorization boundary.
+  // dm_permission is deliberately NOT false: re-authenticating in a DM is the private, sensible place
+  // to do it, and default_member_permissions has no effect in DMs anyway.
+  // default_member_permissions "0" was ALSO removed in 0.8.3 (VoX), for the same reason /access lost it
+  // in 0.8.2 and more urgently: that flag hides a command from anyone without Administrator in a given
+  // guild, so the RECOVERY command for a logged-out bot went invisible on precisely the guilds the
+  // owner does not administer — at precisely the moment it is wanted. The old comment here claimed
+  // visible-but-denied, but that was only ever true in DMs, where the field is inert; in guilds it was
+  // hidden. Now it is genuinely visible everywhere and denied to everyone but the owner, since the
+  // handler gates on DISCORD_OWNER_ID and fails closed. UI visibility was never the boundary.
   { name: 'login',   description: 'Owner-only: re-authenticate this bot to Claude', type: 1,
-    default_member_permissions: '0',
     options: [
       { type: 3, name: 'code', description: 'Paste the code from the login page to finish (omit to start)', required: false },
     ] },
